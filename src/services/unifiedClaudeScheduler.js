@@ -2,6 +2,8 @@ const claudeAccountService = require('./claudeAccountService')
 const claudeConsoleAccountService = require('./claudeConsoleAccountService')
 const bedrockAccountService = require('./bedrockAccountService')
 const accountGroupService = require('./accountGroupService')
+const smartGroupScheduler = require('./smartGroupScheduler')
+const accountHealthService = require('./accountHealthService')
 const redis = require('../models/redis')
 const logger = require('../utils/logger')
 
@@ -29,20 +31,32 @@ class UnifiedClaudeScheduler {
         if (apiKeyData.claudeAccountId.startsWith('group:')) {
           const groupId = apiKeyData.claudeAccountId.replace('group:', '')
           logger.info(
-            `🎯 API key ${apiKeyData.name} is bound to group ${groupId}, selecting from group`
+            `🎯 API key ${apiKeyData.name} is bound to group ${groupId}, using smart group scheduling`
           )
-          return await this.selectAccountFromGroup(groupId, sessionHash, requestedModel)
+          return await smartGroupScheduler.selectAccountFromGroup(groupId, sessionHash, requestedModel, {
+            apiKeyName: apiKeyData.name,
+            apiKeyId: apiKeyData.id
+          })
         }
 
-        // 普通专属账户
+        // 普通专属账户 - 先检查健康状态
         const boundAccount = await redis.getClaudeAccount(apiKeyData.claudeAccountId)
         if (boundAccount && boundAccount.isActive === 'true' && boundAccount.status !== 'error') {
-          logger.info(
-            `🎯 Using bound dedicated Claude OAuth account: ${boundAccount.name} (${apiKeyData.claudeAccountId}) for API key ${apiKeyData.name}`
-          )
-          return {
-            accountId: apiKeyData.claudeAccountId,
-            accountType: 'claude-official'
+          // 检查账户健康状态
+          const healthStatus = await accountHealthService.getAccountHealthStatus(apiKeyData.claudeAccountId)
+          
+          if (healthStatus.healthy && !healthStatus.quarantined) {
+            logger.info(
+              `🎯 Using bound dedicated Claude OAuth account: ${boundAccount.name} (${apiKeyData.claudeAccountId}) for API key ${apiKeyData.name}`
+            )
+            return {
+              accountId: apiKeyData.claudeAccountId,
+              accountType: 'claude-official'
+            }
+          } else {
+            logger.warn(
+              `⚠️ Bound Claude OAuth account ${apiKeyData.claudeAccountId} is unhealthy (${healthStatus.error || 'quarantined'}), falling back to pool`
+            )
           }
         } else {
           logger.warn(

@@ -10,6 +10,7 @@ const config = require('../config/config')
 const logger = require('./utils/logger')
 const redis = require('./models/redis')
 const pricingService = require('./services/pricingService')
+const accountRecoveryManager = require('./services/accountRecoveryManager')
 const cacheMonitor = require('./utils/cacheMonitor')
 
 // Import routes
@@ -23,6 +24,7 @@ const openaiClaudeRoutes = require('./routes/openaiClaudeRoutes')
 const openaiRoutes = require('./routes/openaiRoutes')
 const azureOpenaiRoutes = require('./routes/azureOpenaiRoutes')
 const webhookRoutes = require('./routes/webhook')
+const accountHealthRoutes = require('./routes/accountHealth')
 
 // Import middleware
 const {
@@ -235,6 +237,7 @@ class Application {
       this.app.use('/api', apiRoutes)
       this.app.use('/claude', apiRoutes) // /claude 路由别名，与 /api 功能相同
       this.app.use('/admin', adminRoutes)
+      this.app.use('/admin', accountHealthRoutes)
       // 使用 web 路由（包含 auth 和页面重定向）
       this.app.use('/web', webRoutes)
       this.app.use('/apiStats', apiStatsRoutes)
@@ -454,11 +457,29 @@ class Application {
       // 🔄 定期清理任务
       this.startCleanupTasks()
 
+      // 🏥 启动账户健康监控和恢复管理器
+      await this.startAccountHealthServices()
+
       // 🛑 优雅关闭
       this.setupGracefulShutdown()
     } catch (error) {
       logger.error('💥 Failed to start server:', error)
       process.exit(1)
+    }
+  }
+
+  // 🏥 启动账户健康服务
+  async startAccountHealthServices() {
+    try {
+      logger.info('🏥 Starting account health monitoring services...')
+      
+      // 启动账户恢复管理器（包含健康检查服务）
+      await accountRecoveryManager.start()
+      
+      logger.success('✅ Account health monitoring services started successfully')
+    } catch (error) {
+      logger.error('❌ Failed to start account health services:', error)
+      // 不阻塞应用启动，但记录错误
     }
   }
 

@@ -46,7 +46,7 @@ Claude Relay Service 是一个功能完整的 AI API 中转服务，支持 Claud
 
 ### 基本开发命令
 
-````bash
+```bash
 # 安装依赖和初始化
 npm install
 npm run setup                  # 生成配置和管理员凭据
@@ -54,34 +54,63 @@ npm run install:web           # 安装Web界面依赖
 
 # 开发和运行
 npm run dev                   # 开发模式（热重载）
-npm start                     # 生产模式
-npm test                      # 运行测试
-npm run lint                  # 代码检查
+npm start                     # 生产模式（运行lint检查后启动）
+npm test                      # 运行测试套件
+npm run lint                  # ESLint代码检查
+npm run lint:check            # 仅检查不自动修复
+npm run format                # Prettier格式化代码
+npm run format:check          # 检查代码格式
 
-# Docker部署
-docker-compose up -d          # 推荐方式
-docker-compose --profile monitoring up -d  # 包含监控
+# 构建和部署
+npm run build:web             # 构建前端界面
+npm run docker:build          # 构建Docker镜像
+npm run docker:up             # Docker Compose启动
+npm run docker:down           # Docker Compose停止
 
-# 服务管理
+# 服务管理（后台服务）
 npm run service:start:daemon  # 后台启动（推荐）
+npm run service:start         # 前台启动
+npm run service:stop          # 停止服务
+npm run service:restart       # 重启服务
+npm run service:restart:daemon # 后台重启
 npm run service:status        # 查看服务状态
 npm run service:logs          # 查看日志
-npm run service:stop          # 停止服务
+npm run service:logs:follow   # 实时跟踪日志
+
+# 数据管理
+npm run data:export           # 导出数据
+npm run data:import           # 导入数据
+npm run data:export:sanitized # 导出去敏感信息的数据
+npm run data:debug            # 调试Redis键值
+
+# 系统工具
+npm run monitor               # 系统监控
+npm run status                # 系统状态概览
+npm run status:detail         # 详细状态信息
+npm run update:pricing        # 更新模型定价信息
 
 ### 开发环境配置
-必须配置的环境变量：
+
+**必须配置的环境变量：**
 - `JWT_SECRET`: JWT密钥（32字符以上随机字符串）
 - `ENCRYPTION_KEY`: 数据加密密钥（32字符固定长度）
 - `REDIS_HOST`: Redis主机地址（默认localhost）
 - `REDIS_PORT`: Redis端口（默认6379）
 - `REDIS_PASSWORD`: Redis密码（可选）
 
-初始化命令：
+**可选配置：**
+- `PORT`: 服务端口（默认3000）
+- `LOG_LEVEL`: 日志级别（默认info）
+- `NODE_ENV`: 运行环境（development/production）
+- `WEBHOOK_URLS`: Webhook通知地址
+- `DEFAULT_PROXY_TIMEOUT`: 代理超时时间
+
+**初始化命令：**
 ```bash
 cp config/config.example.js config/config.js
 cp .env.example .env
 npm run setup  # 自动生成密钥并创建管理员账户
-````
+```
 
 ## Web界面功能
 
@@ -105,21 +134,34 @@ npm run setup  # 自动生成密钥并创建管理员账户
 
 ### API转发端点
 
-- `POST /api/v1/messages` - 主要消息处理端点（支持流式）
-- `GET /api/v1/models` - 模型列表（兼容性）
+- `POST /api/v1/messages` - Claude消息处理端点（支持流式）
+- `GET /api/v1/models` - Claude模型列表（兼容性）
 - `GET /api/v1/usage` - 使用统计查询
 - `GET /api/v1/key-info` - API Key信息
+
+### 多平台支持端点
+
+- `POST /claude/v1/messages` - Claude标准端点
+- `POST /gemini/v1/models/gemini-pro:generateContent` - Gemini端点
+- `POST /openai/claude/v1/chat/completions` - OpenAI兼容Claude端点
+- `POST /openai/gemini/v1/chat/completions` - OpenAI兼容Gemini端点
+- `POST /openai/v1/chat/completions` - 标准OpenAI端点
+- `POST /azure/openai/deployments/{deployment}/chat/completions` - Azure OpenAI端点
 
 ### OAuth管理端点
 
 - `POST /admin/claude-accounts/generate-auth-url` - 生成OAuth授权URL（含代理）
 - `POST /admin/claude-accounts/exchange-code` - 交换authorization code
 - `POST /admin/claude-accounts` - 创建OAuth账户
+- `PUT /admin/claude-accounts/{id}` - 更新账户信息
+- `DELETE /admin/claude-accounts/{id}` - 删除账户
 
 ### 系统端点
 
 - `GET /health` - 健康检查
-- `GET /web` - Web管理界面
+- `GET /metrics` - 系统指标
+- `GET /web` - Web管理界面重定向
+- `GET /admin-next/` - 新版管理界面
 - `GET /admin/dashboard` - 系统概览数据
 
 ## 故障排除
@@ -182,11 +224,14 @@ npm run setup  # 自动生成密钥并创建管理员账户
 
 ### 测试和质量保证
 
-- 运行 `npm run lint` 进行代码风格检查（使用 ESLint）
+- 运行 `npm run lint` 进行ESLint代码风格检查（自动修复）
+- 运行 `npm run lint:check` 仅检查代码风格不自动修复
+- 运行 `npm run format` 使用Prettier格式化代码
+- 运行 `npm run format:check` 检查代码格式是否符合规范
 - 运行 `npm test` 执行测试套件（Jest + SuperTest 配置）
-- 在修改核心服务后，使用 CLI 工具验证功能：`npm run cli status`
+- 在修改核心服务后，使用CLI工具验证功能：`npm run cli status`
 - 检查日志文件 `logs/claude-relay-*.log` 确认服务正常运行
-- 注意：当前项目缺少实际测试文件，建议补充单元测试和集成测试
+- 使用 `npm run data:debug` 调试Redis数据结构
 
 ### 开发工作流
 
@@ -197,15 +242,30 @@ npm run setup  # 自动生成密钥并创建管理员账户
 
 ### 常见文件位置
 
-- 核心服务逻辑：`src/services/` 目录
-- 路由处理：`src/routes/` 目录
-- 中间件：`src/middleware/` 目录
-- 配置管理：`config/config.js`
-- Redis 模型：`src/models/redis.js`
-- 工具函数：`src/utils/` 目录
-- 前端主题管理：`web/admin-spa/src/stores/theme.js`
-- 前端组件：`web/admin-spa/src/components/` 目录
-- 前端页面：`web/admin-spa/src/views/` 目录
+- **核心服务逻辑**: `src/services/` 目录
+  - `claudeRelayService.js`: 核心代理服务，处理请求转发和流式响应
+  - `claudeAccountService.js`: Claude账户管理，OAuth token刷新和账户选择
+  - `geminiAccountService.js`: Gemini账户管理，Google OAuth token刷新
+  - `apiKeyService.js`: API Key管理，验证、限流和使用统计
+  - `unifiedClaudeScheduler.js`: 统一的Claude账户调度器
+- **路由处理**: `src/routes/` 目录
+  - `api.js`: Claude API转发路由
+  - `admin.js`: 管理后台API路由
+  - `geminiRoutes.js`: Gemini API路由
+  - `openaiClaudeRoutes.js`: OpenAI兼容Claude路由
+- **中间件**: `src/middleware/auth.js` - 认证和权限中间件
+- **配置管理**: `config/config.js` - 主要配置文件
+- **Redis模型**: `src/models/redis.js` - Redis数据访问层
+- **工具函数**: `src/utils/` 目录
+  - `logger.js`: Winston日志工具
+  - `proxyHelper.js`: 代理配置工具
+  - `costCalculator.js`: 费用计算工具
+  - `oauthHelper.js`: OAuth辅助工具
+- **前端界面**: `web/admin-spa/` 目录
+  - `src/stores/theme.js`: 主题管理
+  - `src/components/`: UI组件
+  - `src/views/`: 页面视图
+- **CLI工具**: `cli/index.js` - 命令行管理工具
 
 ### 重要架构决策
 
