@@ -409,7 +409,7 @@ install_service() {
         rm -rf "$APP_DIR"
     fi
     
-    if ! git clone https://github.com/Wei-Shaw/claude-relay-service.git "$APP_DIR"; then
+    if ! git clone -b feature/smart-account-scheduling https://github.com/slicenferqin/claude-relay-service.git "$APP_DIR"; then
         print_error "克隆项目失败"
         return 1
     fi
@@ -477,9 +477,13 @@ EOF
         git clone --depth 1 --branch web-dist --single-branch \
             https://github.com/Wei-Shaw/claude-relay-service.git \
             "$TEMP_CLONE_DIR" 2>/dev/null || {
-            # 如果 HTTPS 失败，尝试使用当前仓库的 remote URL
+            # 如果原仓库失败，尝试使用当前仓库的 remote URL（如果有web-dist分支）
             REPO_URL=$(git config --get remote.origin.url)
-            git clone --depth 1 --branch web-dist --single-branch "$REPO_URL" "$TEMP_CLONE_DIR"
+            git clone --depth 1 --branch web-dist --single-branch "$REPO_URL" "$TEMP_CLONE_DIR" 2>/dev/null || {
+                # 如果都失败，尝试从用户仓库克隆主分支并构建
+                git clone --depth 1 --branch feature/smart-account-scheduling --single-branch \
+                    https://github.com/slicenferqin/claude-relay-service.git "$TEMP_CLONE_DIR"
+            }
         }
         
         # 复制文件到目标目录（排除 .git 和 README.md）
@@ -687,6 +691,14 @@ update_service() {
             # 如果 HTTPS 失败，尝试使用当前仓库的 remote URL
             REPO_URL=$(git config --get remote.origin.url)
             if git clone --depth 1 --branch web-dist --single-branch "$REPO_URL" "$TEMP_CLONE_DIR" 2>/dev/null; then
+                clone_success=true
+                break
+            fi
+            
+            # 如果web-dist分支不存在，尝试从用户仓库获取智能调度分支
+            if git clone --depth 1 --branch feature/smart-account-scheduling --single-branch \
+                https://github.com/slicenferqin/claude-relay-service.git \
+                "$TEMP_CLONE_DIR" 2>/dev/null; then
                 clone_success=true
                 break
             fi
@@ -1167,6 +1179,9 @@ switch_branch() {
             # 下载前端文件
             if git clone --depth 1 --branch "$web_branch" --single-branch \
                 https://github.com/Wei-Shaw/claude-relay-service.git \
+                "$TEMP_CLONE_DIR" 2>/dev/null || \
+               git clone --depth 1 --branch feature/smart-account-scheduling --single-branch \
+                https://github.com/slicenferqin/claude-relay-service.git \
                 "$TEMP_CLONE_DIR" 2>/dev/null; then
                 
                 # 复制文件到目标目录
