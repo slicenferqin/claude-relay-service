@@ -434,6 +434,150 @@ EOF
     read
 }
 
+# 检查Redis实例是否运行
+check_redis_running() {
+    local redis_port=$1
+    if command_exists redis-cli; then
+        redis-cli -p "$redis_port" ping >/dev/null 2>&1
+        return $?
+    fi
+    return 1
+}
+
+# 启动Redis实例
+start_redis_instance() {
+    local redis_port=$1
+    
+    print_info "检查Redis实例 (端口: $redis_port)..."
+    
+    # 检查是否已在运行
+    if check_redis_running "$redis_port"; then
+        print_success "Redis实例已在运行 (端口: $redis_port)"
+        return 0
+    fi
+    
+    print_info "启动Redis实例 (端口: $redis_port)..."
+    
+    if [ "$redis_port" == "6379" ]; then
+        # 默认端口，启动系统服务
+        if [[ "$OS" == "debian" || "$OS" == "redhat" ]]; then
+            sudo systemctl start redis-server || sudo systemctl start redis
+            sleep 2
+            if check_redis_running "$redis_port"; then
+                print_success "默认Redis服务已启动"
+                return 0
+            fi
+        elif [[ "$OS" == "macos" ]]; then
+            brew services start redis
+            sleep 2
+            if check_redis_running "$redis_port"; then
+                print_success "默认Redis服务已启动"
+                return 0
+            fi
+        fi
+    else
+        # 自定义端口，启动对应服务
+        if [[ "$OS" == "debian" || "$OS" == "redhat" ]]; then
+            if systemctl list-unit-files | grep "redis-$redis_port.service" >/dev/null; then
+                sudo systemctl start "redis-$redis_port"
+                sleep 2
+                if check_redis_running "$redis_port"; then
+                    print_success "Redis实例已启动 (端口: $redis_port)"
+                    return 0
+                fi
+            else
+                print_warning "Redis服务 redis-$redis_port 未配置"
+                print_info "正在配置Redis实例 (端口: $redis_port)..."
+                
+                # 创建配置目录
+                sudo mkdir -p /etc/redis-$redis_port
+                sudo mkdir -p /var/lib/redis-$redis_port
+                sudo mkdir -p /var/log/redis
+                sudo mkdir -p /var/run/redis
+                
+                # 创建基本配置文件
+                sudo tee /etc/redis-$redis_port/redis.conf > /dev/null <<EOF
+port $redis_port
+bind 127.0.0.1
+protected-mode yes
+save 900 1
+save 300 10
+save 60 10000
+dir /var/lib/redis-$redis_port
+logfile /var/log/redis/redis-server-$redis_port.log
+pidfile /var/run/redis/redis-server-$redis_port.pid
+databases 16
+maxmemory-policy allkeys-lru
+EOF
+                
+                # 设置权限
+                sudo chown -R redis:redis /var/lib/redis-$redis_port 2>/dev/null || true
+                
+                # 创建 systemd 服务
+                sudo tee /etc/systemd/system/redis-$redis_port.service > /dev/null <<EOF
+[Unit]
+Description=Redis In-Memory Data Store (Port $redis_port)
+After=network.target
+
+[Service]
+User=redis
+Group=redis
+ExecStart=/usr/bin/redis-server /etc/redis-$redis_port/redis.conf
+ExecStop=/usr/bin/redis-cli -p $redis_port shutdown
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+                
+                # 启动服务
+                sudo systemctl daemon-reload
+                sudo systemctl enable redis-$redis_port
+                sudo systemctl start redis-$redis_port
+                sleep 3
+                
+                if check_redis_running "$redis_port"; then
+                    print_success "Redis实例已配置并启动 (端口: $redis_port)"
+                    return 0
+                fi
+            fi
+        elif [[ "$OS" == "macos" ]]; then
+            local config_dir="$HOME/.redis"
+            local config_file="$config_dir/redis-$redis_port.conf"
+            
+            if [ ! -f "$config_file" ]; then
+                print_info "配置Redis实例 (端口: $redis_port)..."
+                mkdir -p "$config_dir/data-$redis_port"
+                
+                cat > "$config_file" <<EOF
+port $redis_port
+bind 127.0.0.1
+protected-mode yes
+save 900 1
+save 300 10
+save 60 10000
+dir $config_dir/data-$redis_port
+logfile $config_dir/redis-$redis_port.log
+pidfile $config_dir/redis-$redis_port.pid
+databases 16
+maxmemory-policy allkeys-lru
+EOF
+            fi
+            
+            redis-server "$config_file" --daemonize yes
+            sleep 2
+            if check_redis_running "$redis_port"; then
+                print_success "Redis实例已启动 (端口: $redis_port)"
+                return 0
+            fi
+        fi
+    fi
+    
+    print_error "Redis实例启动失败 (端口: $redis_port)"
+    return 1
+}
+
 # 列出所有实例
 list_instances() {
     print_header
@@ -773,6 +917,19 @@ start_instance() {
     local info=$(get_instance_info "$name")
     local dir=$(echo "$info" | grep "DIR:" | cut -d: -f2)
     local port=$(echo "$info" | grep "PORT:" | cut -d: -f2)
+    local redis_port=$(echo "$info" | grep "REDIS_PORT:" | cut -d: -f2)
+    
+    # 检查并启动Redis实例
+    if [ -n "$redis_port" ]; then
+        print_info "检查Redis依赖 (端口: $redis_port)..."
+        if ! start_redis_instance "$redis_port"; then
+            print_error "Redis实例启动失败，无法启动应用实例"
+            echo -n "按回车键继续..."
+            read
+            return 1
+        fi
+        echo
+    fi
     
     print_info "启动实例 '$name'..."
     
@@ -864,6 +1021,7 @@ restart_instance() {
     local info=$(get_instance_info "$name")
     local dir=$(echo "$info" | grep "DIR:" | cut -d: -f2)
     local port=$(echo "$info" | grep "PORT:" | cut -d: -f2)
+    local redis_port=$(echo "$info" | grep "REDIS_PORT:" | cut -d: -f2)
     
     # 停止
     if command_exists pm2 && pm2 list | grep -q "crs-$name"; then
@@ -887,6 +1045,18 @@ restart_instance() {
     fi
     
     sleep 2
+    
+    # 检查并启动Redis实例
+    if [ -n "$redis_port" ]; then
+        print_info "检查Redis依赖 (端口: $redis_port)..."
+        if ! start_redis_instance "$redis_port"; then
+            print_error "Redis实例启动失败，无法重启应用实例"
+            echo -n "按回车键继续..."
+            read
+            return 1
+        fi
+        echo
+    fi
     
     # 启动
     cd "$dir" || return 1
@@ -924,7 +1094,14 @@ status_instance() {
     echo "实例名称: $name"
     echo "安装目录: $dir"
     echo "服务端口: $port"
-    echo "Redis: $redis_host:$redis_port"
+    
+    # 检查Redis状态
+    echo -n "Redis: $redis_host:$redis_port - "
+    if check_redis_running "$redis_port"; then
+        echo -e "${GREEN}运行中${NC}"
+    else
+        echo -e "${RED}未运行${NC}"
+    fi
     
     if is_instance_running "$name"; then
         echo -e "运行状态: ${GREEN}运行中${NC}"
