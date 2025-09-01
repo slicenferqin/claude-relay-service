@@ -330,8 +330,8 @@ async function handleMessagesRequest(req, res) {
       logger.debug(`[DEBUG] Request path: ${req.path}`)
 
       if (accountType === 'claude-official') {
-        // 官方Claude账号使用原有的转发服务
-        response = await claudeRelayService.relayRequest(
+        // 官方Claude账号使用故障转移的转发服务
+        response = await claudeRelayService.relayRequestWithFailover(
           req.body,
           req.apiKey,
           req,
@@ -703,8 +703,8 @@ router.post('/v1/messages/count_tokens', authenticateApiKey, async (req, res) =>
 
     let response
     if (accountType === 'claude-official') {
-      // 使用官方Claude账号转发count_tokens请求
-      response = await claudeRelayService.relayRequest(
+      // 使用官方Claude账号转发count_tokens请求（带故障转移）
+      response = await claudeRelayService.relayRequestWithFailover(
         req.body,
         req.apiKey,
         req,

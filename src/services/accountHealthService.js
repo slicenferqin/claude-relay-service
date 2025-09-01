@@ -168,6 +168,7 @@ class AccountHealthService {
       const startTime = Date.now()
       let isHealthy = false
       let errorMessage = null
+      let testResult = null
       
       try {
         // 根据账户类型发送测试请求
@@ -176,7 +177,8 @@ class AccountHealthService {
             isHealthy = await this.testClaudeAccount(accountId)
             break
           case 'claude-console':
-            isHealthy = await this.testClaudeConsoleAccount(accountId)
+            testResult = await this.testClaudeConsoleAccount(accountId)
+            isHealthy = testResult && testResult.success
             break
           case 'gemini':
             isHealthy = await this.testGeminiAccount(accountId)
@@ -194,19 +196,30 @@ class AccountHealthService {
 
       const responseTime = Date.now() - startTime
       
-      // 记录健康状态
-      await this.recordHealthStatus(accountId, accountType, {
+      // 构建健康状态对象
+      const healthStatus = {
         healthy: isHealthy,
         responseTime,
         error: errorMessage,
         timestamp: new Date().toISOString()
-      })
+      }
+
+      // 如果是Claude Console账户且有模型支持信息，添加到状态中
+      if (accountType === 'claude-console' && testResult && testResult.modelSupport) {
+        healthStatus.modelSupport = testResult.modelSupport
+        healthStatus.testedAt = testResult.testedAt
+      }
+      
+      // 记录健康状态
+      await this.recordHealthStatus(accountId, accountType, healthStatus)
 
       // 分析健康趋势并采取行动
       await this.analyzeHealthTrend(accountId, accountType, accountName)
 
       if (isHealthy) {
-        logger.debug(`✅ Account ${accountName} (${accountType}) is healthy (${responseTime}ms)`)
+        const modelInfo = (testResult && testResult.modelSupport) ? 
+          ` (Models: ${Object.keys(testResult.modelSupport).filter(m => testResult.modelSupport[m].supported).length}/4 supported)` : ''
+        logger.debug(`✅ Account ${accountName} (${accountType}) is healthy (${responseTime}ms)${modelInfo}`)
       } else {
         logger.warn(`❌ Account ${accountName} (${accountType}) is unhealthy: ${errorMessage}`)
       }
@@ -271,27 +284,103 @@ class AccountHealthService {
         throw new Error('Account not found')
       }
 
-      // 发送测试请求到Claude Console API
-      // 这里需要根据实际的Console API实现
-      const response = await axios.post(
-        account.apiEndpoint || 'https://claude.ai/api/organizations/{org_id}/chat_conversations',
-        {
-          prompt: '你好',
-          model: 'claude-3-haiku-20240307',
-          timezone: 'Asia/Shanghai'
-        },
-        {
-          headers: {
-            'Cookie': account.sessionKey,
-            'Content-Type': 'application/json',
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
-          },
-          timeout: 30000,
-          ...(account.proxyConfig && { httpsAgent: claudeConsoleAccountService.createProxyAgent(account.proxyConfig) })
+      // 使用账户配置的apiUrl，如果没有则使用默认值
+      let testUrl = account.apiUrl
+      if (!testUrl) {
+        // 如果没有配置apiUrl，尝试构建默认URL
+        if (account.organizationId) {
+          testUrl = `https://claude.ai/api/organizations/${account.organizationId}/chat_conversations`
+        } else {
+          throw new Error('No API URL or organization ID configured for this account')
         }
-      )
+      }
 
-      return response.status === 200
+      // 定义要测试的模型列表
+      const modelsToTest = [
+        'claude-sonnet-4-20250514',
+        'claude-opus-4-1-20250805', 
+        'claude-3-7-sonnet-20250219',
+        'claude-3-5-haiku-20241022'
+      ]
+
+      const modelSupport = {}
+      let overallSuccess = false
+
+      // 为每个模型发送测试请求
+      for (const model of modelsToTest) {
+        try {
+          const response = await axios.post(
+            testUrl,
+            {
+              prompt: 'Hi',
+              model: model,
+              timezone: 'Asia/Shanghai'
+            },
+            {
+              headers: {
+                'Cookie': account.sessionKey,
+                'Content-Type': 'application/json',
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+              },
+              timeout: 30000,
+              ...(account.proxyConfig && { httpsAgent: claudeConsoleAccountService.createProxyAgent(account.proxyConfig) })
+            }
+          )
+
+          modelSupport[model] = {
+            supported: response.status === 200,
+            status: response.status,
+            error: null
+          }
+
+          if (response.status === 200) {
+            overallSuccess = true
+          }
+
+        } catch (error) {
+          let errorMessage = 'Unknown error'
+          if (error.response?.status === 429) {
+            errorMessage = 'Rate limited'
+          } else if (error.response?.status === 401 || error.response?.status === 403) {
+            errorMessage = 'Session expired'
+          } else if (error.response?.status === 400) {
+            errorMessage = 'Model not supported or invalid request'
+          } else if (error.response?.status === 404) {
+            errorMessage = 'Model not found'
+          } else {
+            errorMessage = error.message
+          }
+
+          modelSupport[model] = {
+            supported: false,
+            status: error.response?.status || null,
+            error: errorMessage
+          }
+        }
+
+        // 在模型测试之间添加短暂延迟，避免触发速率限制
+        await new Promise(resolve => setTimeout(resolve, 500))
+      }
+
+      // 将模型支持信息存储到账户数据中
+      if (account.id) {
+        const updatedAccount = {
+          ...account,
+          modelSupport: modelSupport,
+          lastModelTest: new Date().toISOString()
+        }
+        await claudeConsoleAccountService.updateAccount(account.id, { 
+          modelSupport: modelSupport,
+          lastModelTest: new Date().toISOString()
+        })
+      }
+
+      return {
+        success: overallSuccess,
+        modelSupport: modelSupport,
+        testedAt: new Date().toISOString()
+      }
+
     } catch (error) {
       if (error.response?.status === 429) {
         throw new Error('Rate limited')
@@ -375,15 +464,31 @@ class AccountHealthService {
       const healthKey = `${this.HEALTH_CHECK_PREFIX}${accountId}`
       const historyKey = `${this.HEALTH_HISTORY_PREFIX}${accountId}`
       
-      // 更新当前状态
-      await client.hmset(healthKey, {
+      // 基础状态信息
+      const healthData = {
         accountType,
         healthy: status.healthy.toString(),
         responseTime: status.responseTime.toString(),
         error: status.error || '',
         lastCheck: status.timestamp,
         updatedAt: new Date().toISOString()
-      })
+      }
+
+      // 如果有模型支持信息，添加到健康数据中
+      if (status.modelSupport) {
+        healthData.modelSupport = JSON.stringify(status.modelSupport)
+        healthData.modelTestedAt = status.testedAt || status.timestamp
+        
+        // 统计支持的模型数量
+        const supportedModels = Object.keys(status.modelSupport).filter(
+          model => status.modelSupport[model].supported
+        )
+        healthData.supportedModelsCount = supportedModels.length.toString()
+        healthData.supportedModels = supportedModels.join(',')
+      }
+      
+      // 更新当前状态
+      await client.hmset(healthKey, healthData)
 
       // 记录历史状态（最近50次）
       await client.lpush(historyKey, JSON.stringify(status))

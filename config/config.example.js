@@ -137,6 +137,14 @@ const config = {
     retries: parseInt(process.env.WEBHOOK_RETRIES) || 3 // 重试3次
   },
 
+  // 🆘 故障转移配置
+  failover: {
+    enabled: process.env.FAILOVER_ENABLED !== 'false', // 默认启用
+    maxRetries: parseInt(process.env.FAILOVER_MAX_RETRIES) || 3, // 最大重试次数
+    fallbackAccountId: process.env.FALLBACK_CLAUDE_ACCOUNT_ID || null, // 兜底账户ID
+    tempUnavailableDuration: parseInt(process.env.TEMP_UNAVAILABLE_DURATION) || 300 // 临时不可用时长(秒)
+  },
+
   // 🛠️ 开发配置
   development: {
     debug: process.env.DEBUG === 'true',

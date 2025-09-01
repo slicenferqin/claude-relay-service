@@ -23,7 +23,8 @@ class UnifiedClaudeScheduler {
   }
 
   // 🎯 统一调度Claude账号（官方和Console）
-  async selectAccountForApiKey(apiKeyData, sessionHash = null, requestedModel = null) {
+  async selectAccountForApiKey(apiKeyData, sessionHash = null, requestedModel = null, options = {}) {
+    const { excludeAccounts = [] } = options
     try {
       // 如果API Key绑定了专属账户或分组，优先使用
       if (apiKeyData.claudeAccountId) {
@@ -272,6 +273,15 @@ class UnifiedClaudeScheduler {
     // 获取官方Claude账户（共享池）
     const claudeAccounts = await redis.getAllClaudeAccounts()
     for (const account of claudeAccounts) {
+      // 排除已尝试的账户和临时不可用的账户
+      if (excludeAccounts.includes(account.id)) {
+        continue
+      }
+      
+      if (await this.isAccountTemporarilyUnavailable(account.id, 'claude-official')) {
+        continue
+      }
+      
       if (
         account.isActive === 'true' &&
         account.status !== 'error' &&
@@ -329,6 +339,15 @@ class UnifiedClaudeScheduler {
     logger.info(`📋 Found ${consoleAccounts.length} total Claude Console accounts`)
 
     for (const account of consoleAccounts) {
+      // 排除已尝试的账户和临时不可用的账户
+      if (excludeAccounts.includes(account.id)) {
+        continue
+      }
+      
+      if (await this.isAccountTemporarilyUnavailable(account.id, 'claude-console')) {
+        continue
+      }
+      
       logger.info(
         `🔍 Checking Claude Console account: ${account.name} - isActive: ${account.isActive}, status: ${account.status}, accountType: ${account.accountType}, schedulable: ${account.schedulable}`
       )
@@ -779,6 +798,50 @@ class UnifiedClaudeScheduler {
     } catch (error) {
       logger.error(`❌ Failed to select account from group ${groupId}:`, error)
       throw error
+    }
+  }
+
+  // 🚫 标记账户为临时不可用
+  async markAccountTemporarilyUnavailable(accountId, accountType, duration = null) {
+    const config = require('../../config/config')
+    const defaultDuration = config.failover?.tempUnavailableDuration || 300
+    try {
+      const key = `temp_unavailable:${accountType}:${accountId}`
+      const client = redis.getClientSafe()
+      
+      const actualDuration = duration || defaultDuration
+      await client.set(key, Date.now().toString(), 'EX', actualDuration)
+      
+      logger.warn(`🚫 Marked account ${accountId} (${accountType}) as temporarily unavailable for ${actualDuration}s`)
+    } catch (error) {
+      logger.error(`❌ Failed to mark account ${accountId} as unavailable:`, error)
+    }
+  }
+
+  // ✅ 检查账户是否临时不可用
+  async isAccountTemporarilyUnavailable(accountId, accountType) {
+    try {
+      const key = `temp_unavailable:${accountType}:${accountId}`
+      const client = redis.getClientSafe()
+      
+      const result = await client.get(key)
+      return !!result
+    } catch (error) {
+      logger.error(`❌ Failed to check account ${accountId} availability:`, error)
+      return false
+    }
+  }
+
+  // 🧹 清除账户临时不可用状态
+  async clearTemporaryUnavailable(accountId, accountType) {
+    try {
+      const key = `temp_unavailable:${accountType}:${accountId}`
+      const client = redis.getClientSafe()
+      
+      await client.del(key)
+      logger.info(`✅ Cleared temporary unavailable status for account ${accountId} (${accountType})`)
+    } catch (error) {
+      logger.error(`❌ Failed to clear unavailable status for account ${accountId}:`, error)
     }
   }
 }

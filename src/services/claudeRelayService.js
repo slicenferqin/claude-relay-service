@@ -58,7 +58,117 @@ class ClaudeRelayService {
     return false
   }
 
-  // 🚀 转发请求到Claude API
+  // 🔄 带故障转移的转发请求
+  async relayRequestWithFailover(
+    requestBody,
+    apiKeyData,
+    clientRequest,
+    clientResponse,
+    clientHeaders,
+    options = {}
+  ) {
+    const sessionHash = sessionHelper.generateSessionHash(requestBody)
+    const config = require('../../config/config')
+    const maxRetries = config.failover?.maxRetries || 3 // 最多重试3次（使用不同账户）
+    let lastError = null
+    let attemptedAccounts = []
+
+    logger.info(`🔄 Starting request with failover for API key: ${apiKeyData.name}`)
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        logger.info(`🎯 Attempt ${attempt}/${maxRetries} for API key: ${apiKeyData.name}`)
+
+        // 选择可用的Claude账户（排除已尝试的账户）
+        const accountSelection = await unifiedClaudeScheduler.selectAccountForApiKey(
+          apiKeyData,
+          sessionHash,
+          requestBody.model,
+          { excludeAccounts: attemptedAccounts }
+        )
+
+        if (!accountSelection || !accountSelection.accountId) {
+          logger.warn(`⚠️ No available accounts for attempt ${attempt}`)
+          continue
+        }
+
+        const { accountId, accountType } = accountSelection
+        attemptedAccounts.push(accountId)
+
+        logger.info(`📤 Attempt ${attempt}: Using account ${accountId} (${accountType})`)
+
+        // 尝试使用当前账户发送请求
+        const result = await this.relayRequest(
+          requestBody,
+          apiKeyData,
+          clientRequest,
+          clientResponse,
+          clientHeaders,
+          { ...options, accountId, accountType, attempt }
+        )
+
+        // 检查响应是否正常
+        if (this._isSuccessfulResponse(result)) {
+          logger.info(`✅ Request succeeded on attempt ${attempt} with account ${accountId}`)
+          return result
+        } else {
+          logger.warn(`❌ Request failed on attempt ${attempt} with account ${accountId}: ${result.statusCode}`)
+          lastError = result
+          
+          // 如果是特定错误，标记账户为临时不可用
+          if (this._shouldMarkAccountUnavailable(result)) {
+            logger.warn(`🚫 Marking account ${accountId} as temporarily unavailable`)
+            await unifiedClaudeScheduler.markAccountTemporarilyUnavailable(accountId, accountType)
+          }
+        }
+
+      } catch (error) {
+        logger.error(`💥 Exception on attempt ${attempt}:`, error)
+        lastError = error
+      }
+    }
+
+    // 所有账户都失败了，尝试使用兜底账户
+    logger.warn(`🆘 All accounts failed, trying fallback account`)
+    try {
+      const fallbackResult = await this._tryFallbackAccount(
+        requestBody,
+        apiKeyData,
+        clientRequest,
+        clientResponse,
+        clientHeaders,
+        options
+      )
+      
+      if (fallbackResult) {
+        logger.info(`🆘✅ Fallback account succeeded`)
+        return fallbackResult
+      }
+    } catch (fallbackError) {
+      logger.error(`🆘❌ Fallback account also failed:`, fallbackError)
+    }
+
+    // 所有尝试都失败了
+    logger.error(`💀 All retry attempts exhausted for API key: ${apiKeyData.name}`)
+    
+    if (lastError && lastError.statusCode) {
+      return lastError
+    }
+
+    // 返回通用错误响应
+    return {
+      statusCode: 503,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        error: {
+          type: 'service_unavailable',
+          message: 'All Claude accounts are currently unavailable. Please try again later.'
+        }
+      })
+    }
+  }
+
+  // 🚀 转发请求到Claude API（原方法，现在支持指定账户）
   async relayRequest(
     requestBody,
     apiKeyData,
@@ -106,20 +216,27 @@ class ClaudeRelayService {
         }
       }
 
-      // 生成会话哈希用于sticky会话
-      const sessionHash = sessionHelper.generateSessionHash(requestBody)
-
-      // 选择可用的Claude账户（支持专属绑定和sticky会话）
-      const accountSelection = await unifiedClaudeScheduler.selectAccountForApiKey(
-        apiKeyData,
-        sessionHash,
-        requestBody.model
-      )
-      const { accountId } = accountSelection
-      const { accountType } = accountSelection
+      let accountId, accountType, sessionHash
+      
+      // 如果指定了账户（来自故障转移），直接使用
+      if (options.accountId && options.accountType) {
+        accountId = options.accountId
+        accountType = options.accountType
+        logger.info(`🔧 Using specified account: ${accountId} (${accountType})`)
+      } else {
+        // 正常选择账户
+        sessionHash = sessionHelper.generateSessionHash(requestBody)
+        const accountSelection = await unifiedClaudeScheduler.selectAccountForApiKey(
+          apiKeyData,
+          sessionHash,
+          requestBody.model
+        )
+        accountId = accountSelection.accountId
+        accountType = accountSelection.accountType
+      }
 
       logger.info(
-        `📤 Processing API request for key: ${apiKeyData.name || apiKeyData.id}, account: ${accountId} (${accountType})${sessionHash ? `, session: ${sessionHash}` : ''}`
+        `📤 Processing API request for key: ${apiKeyData.name || apiKeyData.id}, account: ${accountId} (${accountType})${sessionHash ? `, session: ${sessionHash}` : ''}${options.attempt ? `, attempt: ${options.attempt}` : ''}`
       )
 
       // 获取有效的访问token
@@ -1477,6 +1594,73 @@ class ClaudeRelayService {
       logger.info(`✅ Cleared 401 error count for account ${accountId}`)
     } catch (error) {
       logger.error(`❌ Failed to clear 401 errors for account ${accountId}:`, error)
+    }
+  }
+
+  // ✅ 判断响应是否成功
+  _isSuccessfulResponse(result) {
+    if (!result) return false
+    return result.statusCode === 200 || result.statusCode === 201
+  }
+
+  // 🚫 判断是否需要标记账户为不可用
+  _shouldMarkAccountUnavailable(result) {
+    if (!result || !result.statusCode) return false
+    
+    // 401: 认证失败，403: 权限不足，429: 限流，500+: 服务器错误
+    const unavailableStatuses = [401, 403, 429, 500, 502, 503, 504]
+    return unavailableStatuses.includes(result.statusCode)
+  }
+
+  // 🆘 尝试使用兜底账户
+  async _tryFallbackAccount(
+    requestBody,
+    apiKeyData,
+    clientRequest,
+    clientResponse,
+    clientHeaders,
+    options
+  ) {
+    try {
+      // 查找配置的兜底账户
+      const config = require('../../config/config')
+      const fallbackAccountId = config.failover?.fallbackAccountId
+      
+      if (!fallbackAccountId) {
+        logger.warn('🆘 No fallback account configured')
+        return null
+      }
+
+      logger.info(`🆘 Trying fallback account: ${fallbackAccountId}`)
+
+      // 检查兜底账户是否可用
+      const fallbackAccount = await claudeAccountService.getAccount(fallbackAccountId)
+      if (!fallbackAccount || fallbackAccount.isActive !== 'true') {
+        logger.warn(`🆘 Fallback account ${fallbackAccountId} is not available`)
+        return null
+      }
+
+      // 使用兜底账户发送请求
+      const result = await this.relayRequest(
+        requestBody,
+        apiKeyData,
+        clientRequest,
+        clientResponse,
+        clientHeaders,
+        { ...options, accountId: fallbackAccountId, accountType: 'claude-official', isFallback: true }
+      )
+
+      if (this._isSuccessfulResponse(result)) {
+        logger.info(`🆘✅ Fallback account ${fallbackAccountId} succeeded`)
+        return result
+      } else {
+        logger.warn(`🆘❌ Fallback account ${fallbackAccountId} also failed: ${result.statusCode}`)
+        return null
+      }
+
+    } catch (error) {
+      logger.error('🆘💥 Fallback account error:', error)
+      return null
     }
   }
 
