@@ -34,11 +34,11 @@ router.post('/health/:accountId/check', authenticateAdmin, async (req, res) => {
   try {
     const { accountId } = req.params
     const { accountType } = req.body
-    
+
     if (!accountType) {
       return res.status(400).json({ error: 'Account type is required' })
     }
-    
+
     const result = await accountHealthService.checkAccountManually(accountId, accountType)
     return res.json({ success: true, data: result })
   } catch (error) {
@@ -85,11 +85,11 @@ router.post('/recovery/:accountId/manual', authenticateAdmin, async (req, res) =
   try {
     const { accountId } = req.params
     const { accountType } = req.body
-    
+
     if (!accountType) {
       return res.status(400).json({ error: 'Account type is required' })
     }
-    
+
     const result = await accountRecoveryManager.manualRecovery(accountId, accountType)
     return res.json({ success: result.success, data: result })
   } catch (error) {
@@ -127,16 +127,16 @@ router.post('/fallback/:platform', authenticateAdmin, async (req, res) => {
   try {
     const { platform } = req.params
     const { accountId } = req.body
-    
+
     if (!accountId) {
       return res.status(400).json({ error: 'Account ID is required' })
     }
-    
+
     // 验证平台类型
     if (!['claude', 'gemini', 'openai'].includes(platform)) {
       return res.status(400).json({ error: 'Invalid platform. Must be claude, gemini, or openai' })
     }
-    
+
     await smartGroupScheduler.setFallbackAccount(platform, accountId)
     return res.json({ success: true, message: `Fallback account set for ${platform}` })
   } catch (error) {
@@ -152,18 +152,19 @@ router.get('/system/health', authenticateAdmin, async (req, res) => {
       accountHealthService.getHealthStats(),
       accountRecoveryManager.getRecoveryStatus()
     ])
-    
+
     const systemHealth = {
       overall: {
         healthy: healthStats.healthy,
         total: healthStats.total,
-        healthPercentage: healthStats.total > 0 ? Math.round((healthStats.healthy / healthStats.total) * 100) : 100
+        healthPercentage:
+          healthStats.total > 0 ? Math.round((healthStats.healthy / healthStats.total) * 100) : 100
       },
       accounts: healthStats,
       recovery: recoveryStatus,
       timestamp: new Date().toISOString()
     }
-    
+
     return res.json({ success: true, data: systemHealth })
   } catch (error) {
     logger.error('❌ Failed to get system health:', error)
@@ -175,13 +176,13 @@ router.get('/system/health', authenticateAdmin, async (req, res) => {
 router.post('/health/check-all', authenticateAdmin, async (req, res) => {
   try {
     // 异步执行健康检查，不阻塞响应
-    accountHealthService.performHealthCheck().catch(error => {
+    accountHealthService.performHealthCheck().catch((error) => {
       logger.error('❌ Background health check failed:', error)
     })
-    
-    return res.json({ 
-      success: true, 
-      message: 'Full health check started in background' 
+
+    return res.json({
+      success: true,
+      message: 'Full health check started in background'
     })
   } catch (error) {
     logger.error('❌ Failed to start health check:', error)
@@ -193,13 +194,13 @@ router.post('/health/check-all', authenticateAdmin, async (req, res) => {
 router.post('/recovery/check', authenticateAdmin, async (req, res) => {
   try {
     // 异步执行恢复检查
-    accountRecoveryManager.performRecoveryCheck().catch(error => {
+    accountRecoveryManager.performRecoveryCheck().catch((error) => {
       logger.error('❌ Background recovery check failed:', error)
     })
-    
-    return res.json({ 
-      success: true, 
-      message: 'Recovery check started in background' 
+
+    return res.json({
+      success: true,
+      message: 'Recovery check started in background'
     })
   } catch (error) {
     logger.error('❌ Failed to start recovery check:', error)
@@ -212,20 +213,22 @@ router.get('/health/:accountId/history', authenticateAdmin, async (req, res) => 
   try {
     const { accountId } = req.params
     const { limit = 50 } = req.query
-    
+
     const redis = require('../models/redis')
     const client = redis.getClientSafe()
     const historyKey = `account_health_history:${accountId}`
-    
+
     const history = await client.lrange(historyKey, 0, parseInt(limit) - 1)
-    const parsedHistory = history.map(record => {
-      try {
-        return JSON.parse(record)
-      } catch (e) {
-        return null
-      }
-    }).filter(Boolean)
-    
+    const parsedHistory = history
+      .map((record) => {
+        try {
+          return JSON.parse(record)
+        } catch (e) {
+          return null
+        }
+      })
+      .filter(Boolean)
+
     return res.json({ success: true, data: parsedHistory })
   } catch (error) {
     logger.error('❌ Failed to get account health history:', error)
@@ -238,11 +241,11 @@ router.delete('/sessions/account/:accountId', authenticateAdmin, async (req, res
   try {
     const { accountId } = req.params
     const { accountType } = req.body
-    
+
     if (!accountType) {
       return res.status(400).json({ error: 'Account type is required' })
     }
-    
+
     await accountHealthService.clearAccountSessionMappings(accountId, accountType)
     return res.json({ success: true, message: 'Session mappings cleared' })
   } catch (error) {
