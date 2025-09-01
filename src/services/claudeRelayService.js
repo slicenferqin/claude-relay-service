@@ -71,7 +71,7 @@ class ClaudeRelayService {
     const failoverConfig = require('../../config/config')
     const maxRetries = failoverConfig.failover?.maxRetries || 3 // 最多重试3次（使用不同账户）
     let lastError = null
-    let attemptedAccounts = []
+    const attemptedAccounts = []
 
     logger.info(`🔄 Starting request with failover for API key: ${apiKeyData.name}`)
 
@@ -112,16 +112,17 @@ class ClaudeRelayService {
           logger.info(`✅ Request succeeded on attempt ${attempt} with account ${accountId}`)
           return result
         } else {
-          logger.warn(`❌ Request failed on attempt ${attempt} with account ${accountId}: ${result.statusCode}`)
+          logger.warn(
+            `❌ Request failed on attempt ${attempt} with account ${accountId}: ${result.statusCode}`
+          )
           lastError = result
-          
+
           // 如果是特定错误，标记账户为临时不可用
           if (this._shouldMarkAccountUnavailable(result)) {
             logger.warn(`🚫 Marking account ${accountId} as temporarily unavailable`)
             await unifiedClaudeScheduler.markAccountTemporarilyUnavailable(accountId, accountType)
           }
         }
-
       } catch (error) {
         logger.error(`💥 Exception on attempt ${attempt}:`, error)
         lastError = error
@@ -139,7 +140,7 @@ class ClaudeRelayService {
         clientHeaders,
         options
       )
-      
+
       if (fallbackResult) {
         logger.info(`🆘✅ Fallback account succeeded`)
         return fallbackResult
@@ -150,7 +151,7 @@ class ClaudeRelayService {
 
     // 所有尝试都失败了
     logger.error(`💀 All retry attempts exhausted for API key: ${apiKeyData.name}`)
-    
+
     if (lastError && lastError.statusCode) {
       return lastError
     }
@@ -217,10 +218,10 @@ class ClaudeRelayService {
       }
 
       let accountId, accountType, sessionHash
-      
+
       // 如果指定了账户（来自故障转移），直接使用
       if (options.accountId && options.accountType) {
-        ({ accountId, accountType } = options)
+        ;({ accountId, accountType } = options)
         logger.info(`🔧 Using specified account: ${accountId} (${accountType})`)
       } else {
         // 正常选择账户
@@ -229,8 +230,7 @@ class ClaudeRelayService {
           apiKeyData,
           sessionHash,
           requestBody.model
-        )
-        ({ accountId, accountType } = accountSelection)
+        )(({ accountId, accountType } = accountSelection))
       }
 
       logger.info(
@@ -1597,14 +1597,18 @@ class ClaudeRelayService {
 
   // ✅ 判断响应是否成功
   _isSuccessfulResponse(result) {
-    if (!result) return false
+    if (!result) {
+      return false
+    }
     return result.statusCode === 200 || result.statusCode === 201
   }
 
   // 🚫 判断是否需要标记账户为不可用
   _shouldMarkAccountUnavailable(result) {
-    if (!result || !result.statusCode) return false
-    
+    if (!result || !result.statusCode) {
+      return false
+    }
+
     // 401: 认证失败，403: 权限不足，429: 限流，500+: 服务器错误
     const unavailableStatuses = [401, 403, 429, 500, 502, 503, 504]
     return unavailableStatuses.includes(result.statusCode)
@@ -1623,7 +1627,7 @@ class ClaudeRelayService {
       // 查找配置的兜底账户
       const fallbackConfig = require('../../config/config')
       const fallbackAccountId = fallbackConfig.failover?.fallbackAccountId
-      
+
       if (!fallbackAccountId) {
         logger.warn('🆘 No fallback account configured')
         return null
@@ -1645,7 +1649,12 @@ class ClaudeRelayService {
         clientRequest,
         clientResponse,
         clientHeaders,
-        { ...options, accountId: fallbackAccountId, accountType: 'claude-official', isFallback: true }
+        {
+          ...options,
+          accountId: fallbackAccountId,
+          accountType: 'claude-official',
+          isFallback: true
+        }
       )
 
       if (this._isSuccessfulResponse(result)) {
@@ -1655,7 +1664,6 @@ class ClaudeRelayService {
         logger.warn(`🆘❌ Fallback account ${fallbackAccountId} also failed: ${result.statusCode}`)
         return null
       }
-
     } catch (error) {
       logger.error('🆘💥 Fallback account error:', error)
       return null

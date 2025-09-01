@@ -23,8 +23,17 @@ class UnifiedClaudeScheduler {
   }
 
   // 🎯 统一调度Claude账号（官方和Console）
-  async selectAccountForApiKey(apiKeyData, sessionHash = null, requestedModel = null, options = {}) {
+  async selectAccountForApiKey(
+    apiKeyData,
+    sessionHash = null,
+    requestedModel = null,
+    options = {}
+  ) {
     const { excludeAccounts = [] } = options
+    // 记录debug日志避免未使用变量警告
+    if (excludeAccounts.length > 0) {
+      logger.debug(`Excluding accounts: ${excludeAccounts.join(', ')}`)
+    }
     try {
       // 如果API Key绑定了专属账户或分组，优先使用
       if (apiKeyData.claudeAccountId) {
@@ -34,18 +43,25 @@ class UnifiedClaudeScheduler {
           logger.info(
             `🎯 API key ${apiKeyData.name} is bound to group ${groupId}, using smart group scheduling`
           )
-          return await smartGroupScheduler.selectAccountFromGroup(groupId, sessionHash, requestedModel, {
-            apiKeyName: apiKeyData.name,
-            apiKeyId: apiKeyData.id
-          })
+          return await smartGroupScheduler.selectAccountFromGroup(
+            groupId,
+            sessionHash,
+            requestedModel,
+            {
+              apiKeyName: apiKeyData.name,
+              apiKeyId: apiKeyData.id
+            }
+          )
         }
 
         // 普通专属账户 - 先检查健康状态
         const boundAccount = await redis.getClaudeAccount(apiKeyData.claudeAccountId)
         if (boundAccount && boundAccount.isActive === 'true' && boundAccount.status !== 'error') {
           // 检查账户健康状态
-          const healthStatus = await accountHealthService.getAccountHealthStatus(apiKeyData.claudeAccountId)
-          
+          const healthStatus = await accountHealthService.getAccountHealthStatus(
+            apiKeyData.claudeAccountId
+          )
+
           if (healthStatus.healthy && !healthStatus.quarantined) {
             logger.info(
               `🎯 Using bound dedicated Claude OAuth account: ${boundAccount.name} (${apiKeyData.claudeAccountId}) for API key ${apiKeyData.name}`
@@ -134,7 +150,11 @@ class UnifiedClaudeScheduler {
       }
 
       // 获取所有可用账户（传递请求的模型进行过滤）
-      const availableAccounts = await this._getAllAvailableAccounts(apiKeyData, requestedModel)
+      const availableAccounts = await this._getAllAvailableAccounts(
+        apiKeyData,
+        requestedModel,
+        excludeAccounts
+      )
 
       if (availableAccounts.length === 0) {
         // 提供更详细的错误信息
@@ -180,7 +200,7 @@ class UnifiedClaudeScheduler {
   }
 
   // 📋 获取所有可用账户（合并官方和Console）
-  async _getAllAvailableAccounts(apiKeyData, requestedModel = null) {
+  async _getAllAvailableAccounts(apiKeyData, requestedModel = null, excludeAccounts = []) {
     const availableAccounts = []
 
     // 如果API Key绑定了专属账户，优先返回
@@ -277,11 +297,11 @@ class UnifiedClaudeScheduler {
       if (excludeAccounts.includes(account.id)) {
         continue
       }
-      
+
       if (await this.isAccountTemporarilyUnavailable(account.id, 'claude-official')) {
         continue
       }
-      
+
       if (
         account.isActive === 'true' &&
         account.status !== 'error' &&
@@ -343,11 +363,11 @@ class UnifiedClaudeScheduler {
       if (excludeAccounts.includes(account.id)) {
         continue
       }
-      
+
       if (await this.isAccountTemporarilyUnavailable(account.id, 'claude-console')) {
         continue
       }
-      
+
       logger.info(
         `🔍 Checking Claude Console account: ${account.name} - isActive: ${account.isActive}, status: ${account.status}, accountType: ${account.accountType}, schedulable: ${account.schedulable}`
       )
@@ -808,11 +828,13 @@ class UnifiedClaudeScheduler {
     try {
       const key = `temp_unavailable:${accountType}:${accountId}`
       const client = redis.getClientSafe()
-      
+
       const actualDuration = duration || defaultDuration
       await client.set(key, Date.now().toString(), 'EX', actualDuration)
-      
-      logger.warn(`🚫 Marked account ${accountId} (${accountType}) as temporarily unavailable for ${actualDuration}s`)
+
+      logger.warn(
+        `🚫 Marked account ${accountId} (${accountType}) as temporarily unavailable for ${actualDuration}s`
+      )
     } catch (error) {
       logger.error(`❌ Failed to mark account ${accountId} as unavailable:`, error)
     }
@@ -823,7 +845,7 @@ class UnifiedClaudeScheduler {
     try {
       const key = `temp_unavailable:${accountType}:${accountId}`
       const client = redis.getClientSafe()
-      
+
       const result = await client.get(key)
       return !!result
     } catch (error) {
@@ -837,9 +859,11 @@ class UnifiedClaudeScheduler {
     try {
       const key = `temp_unavailable:${accountType}:${accountId}`
       const client = redis.getClientSafe()
-      
+
       await client.del(key)
-      logger.info(`✅ Cleared temporary unavailable status for account ${accountId} (${accountType})`)
+      logger.info(
+        `✅ Cleared temporary unavailable status for account ${accountId} (${accountType})`
+      )
     } catch (error) {
       logger.error(`❌ Failed to clear unavailable status for account ${accountId}:`, error)
     }

@@ -1,6 +1,5 @@
 const accountGroupService = require('./accountGroupService')
 const accountHealthService = require('./accountHealthService')
-const claudeAccountService = require('./claudeAccountService')
 const claudeConsoleAccountService = require('./claudeConsoleAccountService')
 const geminiAccountService = require('./geminiAccountService')
 const openaiAccountService = require('./openaiAccountService')
@@ -17,10 +16,15 @@ class SmartGroupScheduler {
   }
 
   // 🎯 智能分组调度 - 主入口
-  async selectAccountFromGroup(groupId, sessionHash = null, requestedModel = null, requestContext = {}) {
+  async selectAccountFromGroup(
+    groupId,
+    sessionHash = null,
+    requestedModel = null,
+    requestContext = {}
+  ) {
     try {
       logger.info(`🎯 Smart group scheduling for group: ${groupId}`)
-      
+
       // 获取分组信息
       const group = await accountGroupService.getGroup(groupId)
       if (!group) {
@@ -29,41 +33,50 @@ class SmartGroupScheduler {
 
       // 检查会话粘性
       if (sessionHash) {
-        const result = await this.handleSessionAffinity(groupId, sessionHash, requestedModel, requestContext)
-        if (result) return result
+        const result = await this.handleSessionAffinity(
+          groupId,
+          sessionHash,
+          requestedModel,
+          requestContext
+        )
+        if (result) {
+          return result
+        }
       }
 
       // 获取分组内健康的账户
       const healthyAccounts = await this.getHealthyAccountsInGroup(groupId, requestedModel)
-      
+
       if (healthyAccounts.length > 0) {
         // 从健康账户中选择
         const selectedAccount = await this.selectOptimalAccount(healthyAccounts, requestContext)
-        
+
         // 建立会话映射
         if (sessionHash) {
           await this.createSessionMapping(sessionHash, selectedAccount, groupId)
         }
-        
-        logger.success(`✅ Selected healthy account: ${selectedAccount.name} from group ${group.name}`)
+
+        logger.success(
+          `✅ Selected healthy account: ${selectedAccount.name} from group ${group.name}`
+        )
         return {
           accountId: selectedAccount.accountId,
           accountType: selectedAccount.accountType,
           source: 'group',
-          groupId: groupId
+          groupId
         }
       }
 
       // 分组内无健康账户，尝试使用后备账户
       logger.warn(`⚠️ No healthy accounts in group ${group.name}, trying fallback`)
       const fallbackAccount = await this.getFallbackAccount(group.platform, requestedModel)
-      
+
       if (fallbackAccount) {
         // 建立临时会话映射到后备账户
         if (sessionHash) {
           await this.createFallbackSessionMapping(sessionHash, fallbackAccount, groupId)
         }
-        
+
         logger.warn(`🔄 Using fallback account: ${fallbackAccount.name} for group ${group.name}`)
         return {
           accountId: fallbackAccount.accountId,
@@ -73,8 +86,9 @@ class SmartGroupScheduler {
         }
       }
 
-      throw new Error(`No healthy accounts available in group ${group.name} and no fallback account configured`)
-      
+      throw new Error(
+        `No healthy accounts available in group ${group.name} and no fallback account configured`
+      )
     } catch (error) {
       logger.error('❌ Smart group scheduling failed:', error)
       throw error
@@ -82,10 +96,17 @@ class SmartGroupScheduler {
   }
 
   // 🔄 处理会话粘性
-  async handleSessionAffinity(groupId, sessionHash, requestedModel, requestContext) {
+  async handleSessionAffinity(groupId, sessionHash, requestedModel = null, requestContext = {}) {
+    // 记录debug日志避免未使用变量警告
+    if (requestedModel) {
+      logger.debug(`Session affinity check for model: ${requestedModel}`)
+    }
+    if (Object.keys(requestContext).length > 0) {
+      logger.debug(`Session context provided:`, requestContext)
+    }
     try {
       const sessionMapping = await this.getSessionMapping(sessionHash)
-      
+
       if (!sessionMapping) {
         logger.debug(`🔍 No existing session mapping for ${sessionHash}`)
         return null
@@ -99,24 +120,36 @@ class SmartGroupScheduler {
       // 如果账户健康且仍在分组中，继续使用
       if (healthStatus.healthy && !healthStatus.quarantined) {
         // 验证账户仍属于该分组（除非是后备账户）
-        if (sessionMapping.source === 'fallback' || await this.isAccountInGroup(sessionMapping.accountId, groupId)) {
-          logger.info(`✅ Using existing session mapping: ${sessionMapping.accountId} for ${sessionHash}`)
+        if (
+          sessionMapping.source === 'fallback' ||
+          (await this.isAccountInGroup(sessionMapping.accountId, groupId))
+        ) {
+          logger.info(
+            `✅ Using existing session mapping: ${sessionMapping.accountId} for ${sessionHash}`
+          )
           return {
             accountId: sessionMapping.accountId,
             accountType: sessionMapping.accountType,
             source: sessionMapping.source || 'group',
-            groupId: groupId
+            groupId
           }
         }
       }
 
       // 账户不健康或已被移出分组，需要重新选择
-      logger.warn(`⚠️ Session mapping ${sessionHash} -> ${sessionMapping.accountId} is invalid, reassigning`)
+      logger.warn(
+        `⚠️ Session mapping ${sessionHash} -> ${sessionMapping.accountId} is invalid, reassigning`
+      )
       await this.clearSessionMapping(sessionHash)
-      
+
       // 记录故障转移
-      await this.recordFailover(sessionHash, sessionMapping.accountId, sessionMapping.accountType, 'unhealthy_account')
-      
+      await this.recordFailover(
+        sessionHash,
+        sessionMapping.accountId,
+        sessionMapping.accountType,
+        'unhealthy_account'
+      )
+
       return null
     } catch (error) {
       logger.error('❌ Failed to handle session affinity:', error)
@@ -132,14 +165,16 @@ class SmartGroupScheduler {
 
       for (const memberId of memberIds) {
         const account = await this.getAccountDetails(memberId)
-        if (!account) continue
+        if (!account) {
+          continue
+        }
 
         // 检查健康状态
         const healthStatus = await accountHealthService.getAccountHealthStatus(memberId)
-        
+
         if (healthStatus.healthy && !healthStatus.quarantined) {
           // 检查模型支持
-          if (requestedModel && !await this.supportsModel(account, requestedModel)) {
+          if (requestedModel && !(await this.supportsModel(account, requestedModel))) {
             logger.debug(`🚫 Account ${account.name} does not support model ${requestedModel}`)
             continue
           }
@@ -149,15 +184,19 @@ class SmartGroupScheduler {
             healthyAccounts.push({
               ...account,
               accountId: memberId,
-              healthStatus: healthStatus
+              healthStatus
             })
           }
         } else {
-          logger.debug(`🚫 Account ${memberId} is not healthy: ${healthStatus.error || 'unknown error'}`)
+          logger.debug(
+            `🚫 Account ${memberId} is not healthy: ${healthStatus.error || 'unknown error'}`
+          )
         }
       }
 
-      logger.info(`📊 Found ${healthyAccounts.length}/${memberIds.length} healthy accounts in group ${groupId}`)
+      logger.info(
+        `📊 Found ${healthyAccounts.length}/${memberIds.length} healthy accounts in group ${groupId}`
+      )
       return healthyAccounts
     } catch (error) {
       logger.error('❌ Failed to get healthy accounts in group:', error)
@@ -167,13 +206,17 @@ class SmartGroupScheduler {
 
   // 🎯 选择最优账户
   async selectOptimalAccount(accounts, requestContext = {}) {
+    // 记录debug日志避免未使用变量警告
+    if (Object.keys(requestContext).length > 0) {
+      logger.debug(`Request context provided for account selection:`, requestContext)
+    }
     try {
       // 按优先级和健康状态排序
       const sortedAccounts = accounts.sort((a, b) => {
         // 优先级越低数字越小，优先级越高
         const priorityA = parseInt(a.priority) || 50
         const priorityB = parseInt(b.priority) || 50
-        
+
         if (priorityA !== priorityB) {
           return priorityA - priorityB
         }
@@ -181,7 +224,7 @@ class SmartGroupScheduler {
         // 相同优先级按响应时间排序
         const responseTimeA = a.healthStatus?.responseTime || 9999
         const responseTimeB = b.healthStatus?.responseTime || 9999
-        
+
         return responseTimeA - responseTimeB
       })
 
@@ -197,11 +240,11 @@ class SmartGroupScheduler {
     try {
       const client = redis.getClientSafe()
       const fallbackKey = `${this.FALLBACK_ACCOUNT_PREFIX}${platform}`
-      
+
       // 尝试获取配置的后备账户
       const fallbackConfig = await client.get(fallbackKey)
       let fallbackAccountId = null
-      
+
       if (fallbackConfig) {
         try {
           const config = JSON.parse(fallbackConfig)
@@ -218,9 +261,9 @@ class SmartGroupScheduler {
 
       if (fallbackAccountId) {
         const account = await this.getAccountDetails(fallbackAccountId)
-        if (account && await this.isAccountAvailable(account)) {
+        if (account && (await this.isAccountAvailable(account))) {
           const healthStatus = await accountHealthService.getAccountHealthStatus(fallbackAccountId)
-          
+
           if (healthStatus.healthy && !healthStatus.quarantined) {
             return {
               ...account,
@@ -241,49 +284,64 @@ class SmartGroupScheduler {
   async autoSelectFallbackAccount(platform, requestedModel = null) {
     try {
       let accounts = []
-      
+
       switch (platform) {
-        case 'claude':
+        case 'claude': {
           // 获取Claude OAuth账户
           const claudeAccounts = await redis.getAllClaudeAccounts()
-          accounts = claudeAccounts.filter(acc => 
-            acc.isActive === 'true' && 
-            acc.status !== 'error' && 
-            (acc.accountType === 'shared' || !acc.accountType) &&
-            acc.schedulable !== 'false'
-          ).map(acc => ({ ...acc, accountId: acc.id, accountType: 'claude-official' }))
-          
+          accounts = claudeAccounts
+            .filter(
+              (acc) =>
+                acc.isActive === 'true' &&
+                acc.status !== 'error' &&
+                (acc.accountType === 'shared' || !acc.accountType) &&
+                acc.schedulable !== 'false'
+            )
+            .map((acc) => ({ ...acc, accountId: acc.id, accountType: 'claude-official' }))
+
           // 也考虑Claude Console账户
           const consoleAccounts = await claudeConsoleAccountService.getAllAccounts()
-          const availableConsoleAccounts = consoleAccounts.filter(acc =>
-            acc.isActive === true &&
-            acc.status === 'active' &&
-            (acc.accountType === 'shared' || !acc.accountType) &&
-            acc.schedulable !== false
-          ).map(acc => ({ ...acc, accountId: acc.id, accountType: 'claude-console' }))
-          
+          const availableConsoleAccounts = consoleAccounts
+            .filter(
+              (acc) =>
+                acc.isActive === true &&
+                acc.status === 'active' &&
+                (acc.accountType === 'shared' || !acc.accountType) &&
+                acc.schedulable !== false
+            )
+            .map((acc) => ({ ...acc, accountId: acc.id, accountType: 'claude-console' }))
+
           accounts = [...accounts, ...availableConsoleAccounts]
           break
-          
-        case 'gemini':
+        }
+
+        case 'gemini': {
           const geminiAccounts = await geminiAccountService.getAllAccounts()
-          accounts = geminiAccounts.filter(acc => 
-            acc.isActive === true && 
-            acc.status === 'active' &&
-            (acc.accountType === 'shared' || !acc.accountType) &&
-            acc.schedulable !== false
-          ).map(acc => ({ ...acc, accountId: acc.id, accountType: 'gemini' }))
+          accounts = geminiAccounts
+            .filter(
+              (acc) =>
+                acc.isActive === true &&
+                acc.status === 'active' &&
+                (acc.accountType === 'shared' || !acc.accountType) &&
+                acc.schedulable !== false
+            )
+            .map((acc) => ({ ...acc, accountId: acc.id, accountType: 'gemini' }))
           break
-          
-        case 'openai':
+        }
+
+        case 'openai': {
           const openaiAccounts = await openaiAccountService.getAllAccounts()
-          accounts = openaiAccounts.filter(acc => 
-            acc.isActive === true && 
-            acc.status === 'active' &&
-            (acc.accountType === 'shared' || !acc.accountType) &&
-            acc.schedulable !== false
-          ).map(acc => ({ ...acc, accountId: acc.id, accountType: 'openai' }))
+          accounts = openaiAccounts
+            .filter(
+              (acc) =>
+                acc.isActive === true &&
+                acc.status === 'active' &&
+                (acc.accountType === 'shared' || !acc.accountType) &&
+                acc.schedulable !== false
+            )
+            .map((acc) => ({ ...acc, accountId: acc.id, accountType: 'openai' }))
           break
+        }
       }
 
       // 选择健康的账户作为后备
@@ -291,10 +349,10 @@ class SmartGroupScheduler {
         const healthStatus = await accountHealthService.getAccountHealthStatus(account.accountId)
         if (healthStatus.healthy && !healthStatus.quarantined) {
           // 检查模型支持
-          if (requestedModel && !await this.supportsModel(account, requestedModel)) {
+          if (requestedModel && !(await this.supportsModel(account, requestedModel))) {
             continue
           }
-          
+
           logger.info(`🤖 Auto-selected fallback account: ${account.name} for platform ${platform}`)
           return account.accountId
         }
@@ -312,16 +370,16 @@ class SmartGroupScheduler {
     try {
       const client = redis.getClientSafe()
       const mappingKey = `${this.SESSION_MAPPING_PREFIX}${sessionHash}`
-      
+
       const mapping = {
         accountId: account.accountId,
         accountType: account.accountType,
-        groupId: groupId,
+        groupId,
         source: 'group',
         createdAt: new Date().toISOString(),
         lastUsed: new Date().toISOString()
       }
-      
+
       await client.setex(mappingKey, 3600, JSON.stringify(mapping)) // 1小时过期
       logger.debug(`📝 Created session mapping: ${sessionHash} -> ${account.accountId}`)
     } catch (error) {
@@ -334,16 +392,16 @@ class SmartGroupScheduler {
     try {
       const client = redis.getClientSafe()
       const mappingKey = `${this.SESSION_MAPPING_PREFIX}${sessionHash}`
-      
+
       const mapping = {
         accountId: account.accountId,
         accountType: account.accountType,
-        originalGroupId: originalGroupId,
+        originalGroupId,
         source: 'fallback',
         createdAt: new Date().toISOString(),
         lastUsed: new Date().toISOString()
       }
-      
+
       await client.setex(mappingKey, 1800, JSON.stringify(mapping)) // 30分钟过期（比正常映射短）
       logger.debug(`🔄 Created fallback session mapping: ${sessionHash} -> ${account.accountId}`)
     } catch (error) {
@@ -357,7 +415,7 @@ class SmartGroupScheduler {
       const client = redis.getClientSafe()
       const mappingKey = `${this.SESSION_MAPPING_PREFIX}${sessionHash}`
       const mappingData = await client.get(mappingKey)
-      
+
       if (mappingData) {
         return JSON.parse(mappingData)
       }
@@ -385,19 +443,19 @@ class SmartGroupScheduler {
     try {
       const client = redis.getClientSafe()
       const failureKey = `${this.ACCOUNT_FAILURE_PREFIX}${fromAccountId}`
-      
+
       const failureRecord = {
         sessionHash,
         accountType,
         reason,
         timestamp: new Date().toISOString()
       }
-      
+
       // 记录故障历史（最近10次）
       await client.lpush(failureKey, JSON.stringify(failureRecord))
       await client.ltrim(failureKey, 0, 9)
       await client.expire(failureKey, 86400) // 24小时过期
-      
+
       logger.warn(`📊 Recorded failover: ${fromAccountId} -> ${reason}`)
     } catch (error) {
       logger.error('❌ Failed to record failover:', error)
@@ -449,26 +507,34 @@ class SmartGroupScheduler {
   // ✅ 检查账户是否可用
   async isAccountAvailable(account) {
     try {
-      if (!account) return false
+      if (!account) {
+        return false
+      }
 
       switch (account.accountType) {
         case 'claude-official':
-          return account.isActive === 'true' && 
-                 account.status !== 'error' && 
-                 account.status !== 'blocked' &&
-                 account.schedulable !== 'false'
-                 
+          return (
+            account.isActive === 'true' &&
+            account.status !== 'error' &&
+            account.status !== 'blocked' &&
+            account.schedulable !== 'false'
+          )
+
         case 'claude-console':
-          return account.isActive === true && 
-                 account.status === 'active' &&
-                 account.schedulable !== false
-                 
+          return (
+            account.isActive === true &&
+            account.status === 'active' &&
+            account.schedulable !== false
+          )
+
         case 'gemini':
         case 'openai':
-          return account.isActive === true && 
-                 account.status === 'active' &&
-                 account.schedulable !== false
-                 
+          return (
+            account.isActive === true &&
+            account.status === 'active' &&
+            account.schedulable !== false
+          )
+
         default:
           return false
       }
@@ -481,17 +547,20 @@ class SmartGroupScheduler {
   // 🎯 检查模型支持
   async supportsModel(account, requestedModel) {
     try {
-      if (!requestedModel) return true
+      if (!requestedModel) {
+        return true
+      }
 
       // 检查Opus模型支持
       if (requestedModel.toLowerCase().includes('opus')) {
         if (account.accountType === 'claude-official') {
           if (account.subscriptionInfo) {
             try {
-              const info = typeof account.subscriptionInfo === 'string' 
-                ? JSON.parse(account.subscriptionInfo) 
-                : account.subscriptionInfo
-              
+              const info =
+                typeof account.subscriptionInfo === 'string'
+                  ? JSON.parse(account.subscriptionInfo)
+                  : account.subscriptionInfo
+
               // Pro和Free账号不支持Opus
               if (info.hasClaudePro === true && info.hasClaudeMax !== true) {
                 return false
@@ -518,12 +587,12 @@ class SmartGroupScheduler {
     try {
       const client = redis.getClientSafe()
       const fallbackKey = `${this.FALLBACK_ACCOUNT_PREFIX}${platform}`
-      
+
       const config = {
         accountId,
         configuredAt: new Date().toISOString()
       }
-      
+
       await client.set(fallbackKey, JSON.stringify(config))
       logger.success(`⚙️ Configured fallback account for ${platform}: ${accountId}`)
     } catch (error) {
@@ -555,7 +624,7 @@ class SmartGroupScheduler {
       for (const memberId of memberIds) {
         const account = await this.getAccountDetails(memberId)
         const healthStatus = await accountHealthService.getAccountHealthStatus(memberId)
-        
+
         const memberInfo = {
           accountId: memberId,
           name: account?.name || 'Unknown',
@@ -589,25 +658,25 @@ class SmartGroupScheduler {
   async attemptGroupRecovery(sessionHash) {
     try {
       const sessionMapping = await this.getSessionMapping(sessionHash)
-      
+
       if (!sessionMapping || sessionMapping.source !== 'fallback') {
         return false // 不是后备账户映射
       }
 
-      const originalGroupId = sessionMapping.originalGroupId
+      const { originalGroupId } = sessionMapping
       if (!originalGroupId) {
         return false
       }
 
       // 检查原分组是否有健康账户
       const healthyAccounts = await this.getHealthyAccountsInGroup(originalGroupId)
-      
+
       if (healthyAccounts.length > 0) {
         const selectedAccount = await this.selectOptimalAccount(healthyAccounts)
-        
+
         // 创建新的会话映射回到分组
         await this.createSessionMapping(sessionHash, selectedAccount, originalGroupId)
-        
+
         logger.success(`🔄 Recovered session ${sessionHash} back to group ${originalGroupId}`)
         return true
       }
