@@ -10,6 +10,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;36m'
 MAGENTA='\033[0;35m'
+GRAY='\033[0;37m'
 BOLD='\033[1m'
 NC='\033[0m' # No Color
 
@@ -60,16 +61,41 @@ print_header() {
 
 print_menu() {
     echo
-    echo -e "${BOLD}${BLUE}请选择操作：${NC}"
+    # 统计实例信息
+    local total_instances=${#INSTANCES[@]}
+    local running_instances=0
+    
+    if [ $total_instances -gt 0 ]; then
+        for instance_name in "${!INSTANCES[@]}"; do
+            if is_instance_running "$instance_name"; then
+                ((running_instances++))
+            fi
+        done
+        echo -e "${BOLD}${BLUE}请选择操作：${NC} (已安装实例: $total_instances, 运行中: ${GREEN}$running_instances${NC})"
+    else
+        echo -e "${BOLD}${BLUE}请选择操作：${NC} ${YELLOW}(暂无已安装实例)${NC}"
+    fi
+    
     echo "  1. 📦 安装新实例"
     echo "  2. 📋 列出所有实例"
-    echo "  3. 🚀 启动实例"
-    echo "  4. ⏹️  停止实例"
-    echo "  5. 🔄 重启实例"
-    echo "  6. 📊 查看实例状态"
-    echo "  7. 🗑️  删除实例"
+    
+    if [ $total_instances -gt 0 ]; then
+        echo "  3. 🚀 启动实例"
+        echo "  4. ⏹️  停止实例"  
+        echo "  5. 🔄 重启实例"
+        echo "  6. 📊 查看实例状态"
+        echo "  7. 🗑️  删除实例"
+        echo "  9. 💾 另外新启服务（基于现有实例）"
+    else
+        echo -e "  3. ${GRAY}🚀 启动实例 (需要先安装实例)${NC}"
+        echo -e "  4. ${GRAY}⏹️  停止实例 (需要先安装实例)${NC}"
+        echo -e "  5. ${GRAY}🔄 重启实例 (需要先安装实例)${NC}"
+        echo -e "  6. ${GRAY}📊 查看实例状态 (需要先安装实例)${NC}"
+        echo -e "  7. ${GRAY}🗑️  删除实例 (需要先安装实例)${NC}"
+        echo -e "  9. ${GRAY}💾 另外新启服务 (需要先安装实例)${NC}"
+    fi
+    
     echo "  8. 🔧 安装/配置 Redis"
-    echo "  9. 💾 另外新启服务（基于现有实例）"
     echo "  0. ❌ 退出"
     echo
 }
@@ -458,30 +484,68 @@ select_instance() {
     local action=$1
     
     if [ ${#INSTANCES[@]} -eq 0 ]; then
-        print_error "没有可用的实例"
-        echo -n "按回车键继续..."
-        read
-        return 1
+        print_header
+        echo
+        print_warning "没有可用的实例"
+        echo
+        echo "您需要先安装一个实例才能进行${action}操作。"
+        echo
+        echo "选择以下选项之一："
+        echo "  1. 安装新实例"
+        echo "  2. 返回主菜单"
+        echo
+        echo -n "请选择 (1-2): "
+        read choice
+        
+        case $choice in
+            1)
+                install_instance
+                if [ $? -eq 0 ]; then
+                    # 安装成功，重新调用自己进行选择
+                    select_instance "$action"
+                else
+                    return 1
+                fi
+                ;;
+            2|*)
+                return 1
+                ;;
+        esac
+        return 0
     fi
     
+    clear
+    print_header
     echo
-    echo -e "${BOLD}可用实例：${NC}"
+    echo -e "${BOLD}请选择要${action}的实例：${NC}"
+    echo
     local i=1
     local instance_list=()
     for instance_name in $(printf '%s\n' "${!INSTANCES[@]}" | sort); do
-        echo "  $i. $instance_name"
+        local info=$(get_instance_info "$instance_name")
+        local port=$(echo "$info" | grep "PORT:" | cut -d: -f2)
+        local status=""
+        if is_instance_running "$instance_name"; then
+            status="${GREEN}[运行中]${NC}"
+        else
+            status="${RED}[已停止]${NC}"
+        fi
+        echo -e "  $i. $instance_name (端口:$port) $status"
         instance_list+=("$instance_name")
         ((i++))
     done
     
     echo
-    echo -n "请选择实例 (输入数字): "
+    echo -n "请选择实例 (输入数字，按0取消): "
     read choice
+    
+    if [ "$choice" = "0" ]; then
+        return 1
+    fi
     
     if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#instance_list[@]} ]; then
         print_error "无效选择"
-        echo -n "按回车键继续..."
-        read
+        sleep 2
         return 1
     fi
     
