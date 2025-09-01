@@ -68,8 +68,8 @@ class ClaudeRelayService {
     options = {}
   ) {
     const sessionHash = sessionHelper.generateSessionHash(requestBody)
-    const config = require('../../config/config')
-    const maxRetries = config.failover?.maxRetries || 3 // 最多重试3次（使用不同账户）
+    const failoverConfig = require('../../config/config')
+    const maxRetries = failoverConfig.failover?.maxRetries || 3 // 最多重试3次（使用不同账户）
     let lastError = null
     let attemptedAccounts = []
 
@@ -220,8 +220,7 @@ class ClaudeRelayService {
       
       // 如果指定了账户（来自故障转移），直接使用
       if (options.accountId && options.accountType) {
-        accountId = options.accountId
-        accountType = options.accountType
+        ({ accountId, accountType } = options)
         logger.info(`🔧 Using specified account: ${accountId} (${accountType})`)
       } else {
         // 正常选择账户
@@ -231,8 +230,7 @@ class ClaudeRelayService {
           sessionHash,
           requestBody.model
         )
-        accountId = accountSelection.accountId
-        accountType = accountSelection.accountType
+        ({ accountId, accountType } = accountSelection)
       }
 
       logger.info(
@@ -1623,8 +1621,8 @@ class ClaudeRelayService {
   ) {
     try {
       // 查找配置的兜底账户
-      const config = require('../../config/config')
-      const fallbackAccountId = config.failover?.fallbackAccountId
+      const fallbackConfig = require('../../config/config')
+      const fallbackAccountId = fallbackConfig.failover?.fallbackAccountId
       
       if (!fallbackAccountId) {
         logger.warn('🆘 No fallback account configured')

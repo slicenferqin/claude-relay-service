@@ -3,10 +3,10 @@ const claudeAccountService = require('./claudeAccountService')
 const claudeConsoleAccountService = require('./claudeConsoleAccountService')
 const geminiAccountService = require('./geminiAccountService')
 const openaiAccountService = require('./openaiAccountService')
-const accountGroupService = require('./accountGroupService')
+// const accountGroupService = require('./accountGroupService')
 const redis = require('../models/redis')
 const logger = require('../utils/logger')
-const config = require('../../config/config')
+// const config = require('../../config/config')
 
 class AccountHealthService {
   constructor() {
@@ -364,11 +364,11 @@ class AccountHealthService {
 
       // 将模型支持信息存储到账户数据中
       if (account.id) {
-        const updatedAccount = {
-          ...account,
-          modelSupport: modelSupport,
-          lastModelTest: new Date().toISOString()
-        }
+        // const updatedAccount = {
+        //   ...account,
+        //   modelSupport: modelSupport,
+        //   lastModelTest: new Date().toISOString()
+        // }
         await claudeConsoleAccountService.updateAccount(account.id, { 
           modelSupport: modelSupport,
           lastModelTest: new Date().toISOString()
@@ -629,13 +629,14 @@ class AccountHealthService {
   async setAccountSchedulable(accountId, accountType, schedulable) {
     try {
       switch (accountType) {
-        case 'claude-official':
+        case 'claude-official': {
           const account = await redis.getClaudeAccount(accountId)
           if (account) {
             account.schedulable = schedulable.toString()
             await redis.setClaudeAccount(accountId, account)
           }
           break
+        }
         case 'claude-console':
           await claudeConsoleAccountService.updateAccount(accountId, { schedulable })
           break

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const config = require('../config/config')
+// const config = require('../config/config')
 const redis = require('../src/models/redis')
 const accountHealthService = require('../src/services/accountHealthService')
 const smartGroupScheduler = require('../src/services/smartGroupScheduler')
