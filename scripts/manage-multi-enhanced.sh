@@ -67,12 +67,8 @@ print_menu() {
     local running_instances=0
     
     if [ "$total_instances" -gt 0 ]; then
-        for instance_name in $(get_all_instances); do
-            if is_instance_running "$instance_name"; then
-                running_instances=$((running_instances + 1))
-            fi
-        done
-        echo -e "${BOLD}${BLUE}请选择操作：${NC} (已安装实例: $total_instances, 运行中: ${GREEN}$running_instances${NC})"
+        # 跳过运行状态检查以避免菜单显示缓慢，特别是在Linux系统上
+        echo -e "${BOLD}${BLUE}请选择操作：${NC} (已安装实例: $total_instances)"
     else
         echo -e "${BOLD}${BLUE}请选择操作：${NC} ${YELLOW}(暂无已安装实例)${NC}"
     fi
@@ -269,14 +265,32 @@ get_instance_info() {
 # 检查实例是否在运行
 is_instance_running() {
     local name=$1
-    local info=$(get_instance_info "$name")
     
-    if [ -z "$info" ]; then
+    # 直接从配置文件获取端口信息，避免复杂的函数调用
+    if [ ! -f "$INSTANCES_CONFIG_FILE" ]; then
         return 1
     fi
     
-    local port=$(echo "$info" | grep "PORT:" | cut -d: -f2)
-    check_port "$port"
+    local config=$(grep "^$name=" "$INSTANCES_CONFIG_FILE" 2>/dev/null | head -1 | cut -d'=' -f2-)
+    if [ -z "$config" ]; then
+        return 1
+    fi
+    
+    local port=$(echo "$config" | cut -d: -f2)
+    if [ -z "$port" ]; then
+        return 1
+    fi
+    
+    # 简化端口检查，使用超时避免卡住
+    if command_exists lsof; then
+        timeout 5 lsof -i ":$port" >/dev/null 2>&1
+    elif command_exists netstat; then
+        timeout 5 netstat -tuln 2>/dev/null | grep ":$port " >/dev/null 2>&1
+    elif command_exists ss; then
+        timeout 5 ss -tuln 2>/dev/null | grep ":$port " >/dev/null 2>&1
+    else
+        return 1
+    fi
 }
 
 # 安装 Redis
@@ -694,12 +708,15 @@ list_instances() {
             local redis_host=$(echo "$config" | cut -d: -f3)
             local redis_port=$(echo "$config" | cut -d: -f4)
             
-            # 检查运行状态
-            local status_text=""
-            if is_instance_running "$instance_name"; then
-                status_text="运行中"
-            else
-                status_text="已停止"
+            # 检查运行状态 (快速模式，避免在Linux系统上卡住)
+            local status_text="未知"
+            # 可以通过环境变量 SKIP_STATUS_CHECK=1 来跳过状态检查
+            if [ "${SKIP_STATUS_CHECK:-0}" != "1" ]; then
+                if is_instance_running "$instance_name"; then
+                    status_text="运行中"
+                else
+                    status_text="已停止"
+                fi
             fi
             
             # 简化目录显示
@@ -767,13 +784,8 @@ select_instance() {
         
         if [ -n "$config" ]; then
             local port=$(echo "$config" | cut -d: -f2)
-            local status=""
-            if is_instance_running "$instance_name"; then
-                status="${GREEN}[运行中]${NC}"
-            else
-                status="${RED}[已停止]${NC}"
-            fi
-            echo -e "  $i. $instance_name (端口:$port) $status"
+            # 跳过运行状态检查以避免在Linux系统上卡住，直接显示实例信息
+            echo -e "  $i. $instance_name (端口:$port)"
             if [ -z "$instance_names" ]; then
                 instance_names="$instance_name"
             else
