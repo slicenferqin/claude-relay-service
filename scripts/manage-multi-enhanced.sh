@@ -4,6 +4,8 @@
 # 支持在同一服务器上部署多个服务实例
 # 新增 Redis 安装和交互式菜单功能
 
+# 兼容旧版本bash，不使用关联数组
+
 # 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -32,8 +34,7 @@ REDIS_HOST=""
 REDIS_PORT=""
 REDIS_PASSWORD=""
 
-# 实例配置数组
-declare -A INSTANCES
+# 实例配置通过配置文件管理，不使用关联数组
 
 # 打印带颜色的消息
 print_info() {
@@ -62,13 +63,13 @@ print_header() {
 print_menu() {
     echo
     # 统计实例信息
-    local total_instances=${#INSTANCES[@]}
+    local total_instances=$(get_instances_count)
     local running_instances=0
     
-    if [ $total_instances -gt 0 ]; then
-        for instance_name in "${!INSTANCES[@]}"; do
+    if [ "$total_instances" -gt 0 ]; then
+        for instance_name in $(get_all_instances); do
             if is_instance_running "$instance_name"; then
-                ((running_instances++))
+                running_instances=$((running_instances + 1))
             fi
         done
         echo -e "${BOLD}${BLUE}请选择操作：${NC} (已安装实例: $total_instances, 运行中: ${GREEN}$running_instances${NC})"
@@ -79,21 +80,12 @@ print_menu() {
     echo "  1. 📦 安装新实例"
     echo "  2. 📋 列出所有实例"
     
-    if [ $total_instances -gt 0 ]; then
-        echo "  3. 🚀 启动实例"
-        echo "  4. ⏹️  停止实例"  
-        echo "  5. 🔄 重启实例"
-        echo "  6. 📊 查看实例状态"
-        echo "  7. 🗑️  删除实例"
-        echo "  9. 💾 另外新启服务（基于现有实例）"
-    else
-        echo -e "  3. ${GRAY}🚀 启动实例 (需要先安装实例)${NC}"
-        echo -e "  4. ${GRAY}⏹️  停止实例 (需要先安装实例)${NC}"
-        echo -e "  5. ${GRAY}🔄 重启实例 (需要先安装实例)${NC}"
-        echo -e "  6. ${GRAY}📊 查看实例状态 (需要先安装实例)${NC}"
-        echo -e "  7. ${GRAY}🗑️  删除实例 (需要先安装实例)${NC}"
-        echo -e "  9. ${GRAY}💾 另外新启服务 (需要先安装实例)${NC}"
-    fi
+    echo "  3. 🚀 启动实例"
+    echo "  4. ⏹️  停止实例"  
+    echo "  5. 🔄 重启实例"
+    echo "  6. 📊 查看实例状态"
+    echo "  7. 🗑️  删除实例"
+    echo "  9. 💾 另外新启服务（基于现有实例）"
     
     echo "  8. 🔧 安装/配置 Redis"
     echo "  0. ❌ 退出"
@@ -179,21 +171,47 @@ get_next_available_port() {
 
 # 加载实例配置
 load_instances_config() {
-    if [ -f "$INSTANCES_CONFIG_FILE" ]; then
-        while IFS='=' read -r key value; do
-            if [[ $key && $value ]]; then
-                INSTANCES[$key]=$value
-            fi
-        done < "$INSTANCES_CONFIG_FILE"
+    # 配置文件存在性检查，内容通过其他函数读取
+    if [ ! -f "$INSTANCES_CONFIG_FILE" ]; then
+        touch "$INSTANCES_CONFIG_FILE"
     fi
 }
 
 # 保存实例配置
 save_instances_config() {
-    > "$INSTANCES_CONFIG_FILE"
-    for instance_name in "${!INSTANCES[@]}"; do
-        echo "$instance_name=${INSTANCES[$instance_name]}" >> "$INSTANCES_CONFIG_FILE"
-    done
+    # 配置通过add_instance_config和remove_instance_config管理
+    return 0
+}
+
+# 添加实例配置
+add_instance_config() {
+    local name=$1
+    local config=$2
+    # 删除旧配置（如果存在）
+    remove_instance_config "$name"
+    # 添加新配置
+    echo "$name=$config" >> "$INSTANCES_CONFIG_FILE"
+}
+
+# 删除实例配置
+remove_instance_config() {
+    local name=$1
+    if [ -f "$INSTANCES_CONFIG_FILE" ]; then
+        grep -v "^$name=" "$INSTANCES_CONFIG_FILE" > "$INSTANCES_CONFIG_FILE.tmp" || true
+        mv "$INSTANCES_CONFIG_FILE.tmp" "$INSTANCES_CONFIG_FILE"
+    fi
+}
+
+# 获取所有实例名称
+get_all_instances() {
+    if [ -f "$INSTANCES_CONFIG_FILE" ]; then
+        grep -v '^$' "$INSTANCES_CONFIG_FILE" | cut -d'=' -f1 | sort
+    fi
+}
+
+# 获取实例数量
+get_instances_count() {
+    get_all_instances | wc -l | tr -d ' '
 }
 
 # 验证实例名称
@@ -209,20 +227,38 @@ validate_instance_name() {
 # 检查实例是否存在
 instance_exists() {
     local name=$1
-    [ -n "${INSTANCES[$name]}" ]
+    if [ -f "$INSTANCES_CONFIG_FILE" ]; then
+        grep -q "^$name=" "$INSTANCES_CONFIG_FILE"
+    else
+        return 1
+    fi
 }
 
 # 获取实例信息
 get_instance_info() {
     local name=$1
-    local config="${INSTANCES[$name]}"
+    local config=""
+    
+    if [ -f "$INSTANCES_CONFIG_FILE" ]; then
+        config=$(grep "^$name=" "$INSTANCES_CONFIG_FILE" 2>/dev/null | head -1 | cut -d'=' -f2-)
+    fi
     
     if [ -z "$config" ]; then
         return 1
     fi
     
     # 解析配置：dir:port:redis_host:redis_port
-    IFS=':' read -r instance_dir instance_port instance_redis_host instance_redis_port <<< "$config"
+    local instance_dir instance_port instance_redis_host instance_redis_port
+    
+    # 使用临时变量分割
+    local old_ifs="$IFS"
+    IFS=':'
+    set -- $config
+    instance_dir="$1"
+    instance_port="$2" 
+    instance_redis_host="$3"
+    instance_redis_port="$4"
+    IFS="$old_ifs"
     
     echo "DIR:$instance_dir"
     echo "PORT:$instance_port"
@@ -310,12 +346,39 @@ install_redis() {
     if [ "$redis_port" == "6379" ]; then
         print_info "启动默认 Redis 服务..."
         if [[ "$OS" == "debian" || "$OS" == "redhat" ]]; then
-            sudo systemctl enable redis-server || sudo systemctl enable redis
-            sudo systemctl start redis-server || sudo systemctl start redis
+            sudo systemctl enable redis-server 2>/dev/null || sudo systemctl enable redis 2>/dev/null
+            sudo systemctl start redis-server 2>/dev/null || sudo systemctl start redis 2>/dev/null
+            sleep 2
+            if redis-cli ping >/dev/null 2>&1; then
+                print_success "默认 Redis 服务已启动 (端口: 6379)"
+            else
+                print_warning "Redis 服务可能启动失败，请检查服务状态"
+            fi
         elif [[ "$OS" == "macos" ]]; then
-            brew services start redis
+            if brew services list | grep redis | grep -q started; then
+                print_success "默认 Redis 服务已运行 (端口: 6379)"
+            else
+                brew services start redis
+                sleep 2
+                if redis-cli ping >/dev/null 2>&1; then
+                    print_success "默认 Redis 服务已启动 (端口: 6379)"
+                else
+                    print_warning "Redis 服务可能启动失败，请检查服务状态"
+                fi
+            fi
         fi
-        print_success "默认 Redis 服务已启动 (端口: 6379)"
+        
+        # 测试连接
+        if redis-cli -p $redis_port ping >/dev/null 2>&1; then
+            print_success "Redis 连接测试成功"
+            echo "redis_$redis_port=localhost:$redis_port" >> "$REDIS_CONFIG_FILE"
+        else
+            print_warning "Redis 连接测试失败，但服务可能仍在启动中"
+        fi
+        
+        echo
+        echo -n "按回车键继续..."
+        read
         return 0
     fi
     
@@ -354,7 +417,14 @@ EOF
         sudo sed -i "s|^logfile .*|logfile /var/log/redis/redis-server-$redis_port.log|" /etc/redis-$redis_port/redis.conf
         
         # 设置权限
-        sudo chown redis:redis /var/lib/redis-$redis_port 2>/dev/null || sudo chown redis:redis /var/lib/redis-$redis_port
+        sudo chown -R redis:redis /var/lib/redis-$redis_port 2>/dev/null || {
+            # 如果redis用户不存在，创建一个
+            sudo useradd -r -s /bin/false redis 2>/dev/null || true
+            sudo chown -R redis:redis /var/lib/redis-$redis_port 2>/dev/null || {
+                # 如果仍然失败，使用当前用户
+                sudo chown -R $USER:$USER /var/lib/redis-$redis_port
+            }
+        }
         
         # 创建 systemd 服务
         sudo tee /etc/systemd/system/redis-$redis_port.service > /dev/null <<EOF
@@ -380,11 +450,20 @@ EOF
         sudo systemctl start redis-$redis_port
         
         # 检查状态
-        if sudo systemctl is-active redis-$redis_port >/dev/null; then
+        sleep 3
+        if sudo systemctl is-active redis-$redis_port >/dev/null 2>&1; then
             print_success "Redis 实例已启动 (端口: $redis_port)"
         else
-            print_error "Redis 实例启动失败"
-            return 1
+            print_warning "正在检查Redis服务状态..."
+            sudo systemctl status redis-$redis_port --no-pager -l
+            if redis-cli -p $redis_port ping >/dev/null 2>&1; then
+                print_success "Redis实例响应正常 (端口: $redis_port)"
+            else
+                print_error "Redis 实例启动失败或无法连接"
+                echo "尝试手动启动: sudo systemctl start redis-$redis_port"
+                echo "查看日志: sudo journalctl -u redis-$redis_port -f"
+                return 1
+            fi
         fi
         
     elif [[ "$OS" == "macos" ]]; then
@@ -409,12 +488,16 @@ EOF
         mkdir -p "$config_dir/data-$redis_port"
         
         # 启动 Redis 实例
+        print_info "启动 Redis 实例 (端口: $redis_port)..."
         redis-server "$config_dir/redis-$redis_port.conf" --daemonize yes
+        sleep 2
         
         if redis-cli -p $redis_port ping >/dev/null 2>&1; then
             print_success "Redis 实例已启动 (端口: $redis_port)"
         else
             print_error "Redis 实例启动失败"
+            print_info "尝试手动检查: redis-cli -p $redis_port ping"
+            print_info "配置文件: $config_dir/redis-$redis_port.conf"
             return 1
         fi
     fi
@@ -583,7 +666,8 @@ list_instances() {
     print_header
     echo
     
-    if [ ${#INSTANCES[@]} -eq 0 ]; then
+    local total_instances=$(get_instances_count)
+    if [ "$total_instances" -eq 0 ]; then
         print_info "未找到已安装的实例"
         echo
         print_info "使用菜单选项 1 安装新实例"
@@ -596,26 +680,34 @@ list_instances() {
     printf "%-20s %-8s %-15s %-10s %s\n" "实例名称" "端口" "目录" "状态" "Redis"
     printf "%-20s %-8s %-15s %-10s %s\n" "--------" "----" "----" "----" "-----"
     
-    for instance_name in $(printf '%s\n' "${!INSTANCES[@]}" | sort); do
-        local info=$(get_instance_info "$instance_name")
-        local dir=$(echo "$info" | grep "DIR:" | cut -d: -f2)
-        local port=$(echo "$info" | grep "PORT:" | cut -d: -f2)
-        local redis_host=$(echo "$info" | grep "REDIS_HOST:" | cut -d: -f2)
-        local redis_port=$(echo "$info" | grep "REDIS_PORT:" | cut -d: -f2)
-        
-        # 检查运行状态
-        local status=""
-        if is_instance_running "$instance_name"; then
-            status="${GREEN}运行中${NC}"
-        else
-            status="${RED}已停止${NC}"
+    for instance_name in $(get_all_instances); do
+        # 直接获取配置，不使用函数
+        local config=""
+        if [ -f "$INSTANCES_CONFIG_FILE" ]; then
+            config=$(grep "^$instance_name=" "$INSTANCES_CONFIG_FILE" 2>/dev/null | head -1 | cut -d'=' -f2-)
         fi
         
-        # 简化目录显示
-        local short_dir=$(basename "$dir")
-        
-        printf "%-20s %-8s %-15s %-18s %s:%s\n" \
-            "$instance_name" "$port" "$short_dir" "$status" "$redis_host" "$redis_port"
+        if [ -n "$config" ]; then
+            # 直接解析配置
+            local dir=$(echo "$config" | cut -d: -f1)
+            local port=$(echo "$config" | cut -d: -f2)
+            local redis_host=$(echo "$config" | cut -d: -f3)
+            local redis_port=$(echo "$config" | cut -d: -f4)
+            
+            # 检查运行状态
+            local status_text=""
+            if is_instance_running "$instance_name"; then
+                status_text="运行中"
+            else
+                status_text="已停止"
+            fi
+            
+            # 简化目录显示
+            local short_dir=$(basename "$dir")
+            
+            printf "%-20s %-8s %-15s %-10s %s:%s\n" \
+                "$instance_name" "$port" "$short_dir" "$status_text" "$redis_host" "$redis_port"
+        fi
     done
     
     echo
@@ -626,8 +718,9 @@ list_instances() {
 # 选择实例
 select_instance() {
     local action=$1
+    local total_instances=$(get_instances_count)
     
-    if [ ${#INSTANCES[@]} -eq 0 ]; then
+    if [ "$total_instances" -eq 0 ]; then
         print_header
         echo
         print_warning "没有可用的实例"
@@ -664,20 +757,39 @@ select_instance() {
     echo -e "${BOLD}请选择要${action}的实例：${NC}"
     echo
     local i=1
-    local instance_list=()
-    for instance_name in $(printf '%s\n' "${!INSTANCES[@]}" | sort); do
-        local info=$(get_instance_info "$instance_name")
-        local port=$(echo "$info" | grep "PORT:" | cut -d: -f2)
-        local status=""
-        if is_instance_running "$instance_name"; then
-            status="${GREEN}[运行中]${NC}"
-        else
-            status="${RED}[已停止]${NC}"
+    local instance_names=""
+    for instance_name in $(get_all_instances); do
+        # 直接获取配置，不使用函数
+        local config=""
+        if [ -f "$INSTANCES_CONFIG_FILE" ]; then
+            config=$(grep "^$instance_name=" "$INSTANCES_CONFIG_FILE" 2>/dev/null | head -1 | cut -d'=' -f2-)
         fi
-        echo -e "  $i. $instance_name (端口:$port) $status"
-        instance_list+=("$instance_name")
-        ((i++))
+        
+        if [ -n "$config" ]; then
+            local port=$(echo "$config" | cut -d: -f2)
+            local status=""
+            if is_instance_running "$instance_name"; then
+                status="${GREEN}[运行中]${NC}"
+            else
+                status="${RED}[已停止]${NC}"
+            fi
+            echo -e "  $i. $instance_name (端口:$port) $status"
+            if [ -z "$instance_names" ]; then
+                instance_names="$instance_name"
+            else
+                instance_names="$instance_names|$instance_name"
+            fi
+            i=$((i + 1))
+        fi
     done
+    
+    local total_count=$((i - 1))
+    
+    if [ "$total_count" -eq 0 ]; then
+        print_error "没有有效的实例配置"
+        sleep 2
+        return 1
+    fi
     
     echo
     echo -n "请选择实例 (输入数字，按0取消): "
@@ -687,13 +799,14 @@ select_instance() {
         return 1
     fi
     
-    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#instance_list[@]} ]; then
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "$total_count" ]; then
         print_error "无效选择"
         sleep 2
         return 1
     fi
     
-    local selected_instance="${instance_list[$((choice-1))]}"
+    # 获取选中的实例名
+    local selected_instance=$(echo "$instance_names" | cut -d'|' -f"$choice")
     echo "$selected_instance"
 }
 
@@ -884,8 +997,7 @@ EOF
     fi
     
     # 保存实例配置
-    INSTANCES[$INSTANCE_NAME]="$INSTANCE_DIR:$APP_PORT:$REDIS_HOST:$REDIS_PORT"
-    save_instances_config
+    add_instance_config "$INSTANCE_NAME" "$INSTANCE_DIR:$APP_PORT:$REDIS_HOST:$REDIS_PORT"
     
     print_success "实例 '$INSTANCE_NAME' 安装完成！"
     echo
@@ -1184,8 +1296,7 @@ remove_instance() {
     rm -rf "$dir"
     
     # 从配置中移除
-    unset INSTANCES[$name]
-    save_instances_config
+    remove_instance_config "$name"
     
     print_success "实例 '$name' 已删除"
     echo -n "按回车键继续..."
@@ -1194,7 +1305,8 @@ remove_instance() {
 
 # 另外新启服务（基于现有实例）
 clone_instance() {
-    if [ ${#INSTANCES[@]} -eq 0 ]; then
+    local total_instances=$(get_instances_count)
+    if [ "$total_instances" -eq 0 ]; then
         print_error "没有可用的实例作为模板"
         echo -n "按回车键继续..."
         read
@@ -1346,8 +1458,7 @@ clone_instance() {
     npm run setup
     
     # 保存实例配置
-    INSTANCES[$new_name]="$new_dir:$new_port:$redis_host:$redis_port"
-    save_instances_config
+    add_instance_config "$new_name" "$new_dir:$new_port:$redis_host:$redis_port"
     
     print_success "新实例 '$new_name' 创建完成！"
     echo
@@ -1393,25 +1504,97 @@ main_menu() {
                 list_instances
                 ;;
             3)
-                start_instance
+                local total_instances=$(get_instances_count)
+                if [ "$total_instances" -eq 0 ]; then
+                    print_header
+                    echo
+                    print_warning "没有可用的实例"
+                    echo
+                    echo "您需要先安装一个实例才能启动。"
+                    echo
+                    echo -n "按回车键继续..."
+                    read
+                else
+                    start_instance
+                fi
                 ;;
             4)
-                stop_instance
+                local total_instances=$(get_instances_count)
+                if [ "$total_instances" -eq 0 ]; then
+                    print_header
+                    echo
+                    print_warning "没有可用的实例"
+                    echo
+                    echo "您需要先安装一个实例才能停止。"
+                    echo
+                    echo -n "按回车键继续..."
+                    read
+                else
+                    stop_instance
+                fi
                 ;;
             5)
-                restart_instance
+                local total_instances=$(get_instances_count)
+                if [ "$total_instances" -eq 0 ]; then
+                    print_header
+                    echo
+                    print_warning "没有可用的实例"
+                    echo
+                    echo "您需要先安装一个实例才能重启。"
+                    echo
+                    echo -n "按回车键继续..."
+                    read
+                else
+                    restart_instance
+                fi
                 ;;
             6)
-                status_instance
+                local total_instances=$(get_instances_count)
+                if [ "$total_instances" -eq 0 ]; then
+                    print_header
+                    echo
+                    print_warning "没有可用的实例"
+                    echo
+                    echo "您需要先安装一个实例才能查看状态。"
+                    echo
+                    echo -n "按回车键继续..."
+                    read
+                else
+                    status_instance
+                fi
                 ;;
             7)
-                remove_instance
+                local total_instances=$(get_instances_count)
+                if [ "$total_instances" -eq 0 ]; then
+                    print_header
+                    echo
+                    print_warning "没有可用的实例"
+                    echo
+                    echo "您需要先安装一个实例才能删除。"
+                    echo
+                    echo -n "按回车键继续..."
+                    read
+                else
+                    remove_instance
+                fi
                 ;;
             8)
                 install_redis
                 ;;
             9)
-                clone_instance
+                local total_instances=$(get_instances_count)
+                if [ "$total_instances" -eq 0 ]; then
+                    print_header
+                    echo
+                    print_warning "没有可用的实例"
+                    echo
+                    echo "您需要先安装一个实例作为模板。"
+                    echo
+                    echo -n "按回车键继续..."
+                    read
+                else
+                    clone_instance
+                fi
                 ;;
             0)
                 print_info "再见！"
