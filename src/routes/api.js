@@ -1,8 +1,8 @@
 const express = require('express')
 const claudeRelayService = require('../services/claudeRelayService')
 const claudeConsoleRelayService = require('../services/claudeConsoleRelayService')
-const bedrockRelayService = require('../services/bedrockRelayService')
-const bedrockAccountService = require('../services/bedrockAccountService')
+// const bedrockRelayService = require('../services/bedrockRelayService')  // 未使用，注释掉
+// const bedrockAccountService = require('../services/bedrockAccountService')  // 未使用，注释掉
 const unifiedClaudeScheduler = require('../services/unifiedClaudeScheduler')
 const apiKeyService = require('../services/apiKeyService')
 const { authenticateApiKey } = require('../middleware/auth')
@@ -161,83 +161,19 @@ async function handleMessagesRequest(req, res) {
         apiKeyName: req.apiKey.name
       })
 
-      // 生成会话哈希用于sticky会话
-      const sessionHash = sessionHelper.generateSessionHash(req.body)
-
-      // 使用统一调度选择账号（传递请求的模型）
-      const requestedModel = req.body.model
-      const { accountId, accountType } = await unifiedClaudeScheduler.selectAccountForApiKey(
-        req.apiKey,
-        sessionHash,
-        requestedModel
-      )
-
-      // 根据账号类型选择对应的转发服务
-      let response
+      // 使用新的重试功能处理非流式请求（支持Claude Official和Console）
       logger.debug(`[DEBUG] Request query params: ${JSON.stringify(req.query)}`)
       logger.debug(`[DEBUG] Request URL: ${req.url}`)
       logger.debug(`[DEBUG] Request path: ${req.path}`)
 
-      if (accountType === 'claude-official') {
-        // 官方Claude账号使用故障转移的转发服务
-        response = await claudeRelayService.relayRequestWithFailover(
-          req.body,
-          req.apiKey,
-          req,
-          res,
-          req.headers
-        )
-      } else if (accountType === 'claude-console') {
-        // Claude Console账号使用Console转发服务
-        logger.debug(
-          `[DEBUG] Calling claudeConsoleRelayService.relayRequest with accountId: ${accountId}`
-        )
-        response = await claudeConsoleRelayService.relayRequest(
-          req.body,
-          req.apiKey,
-          req,
-          res,
-          req.headers,
-          accountId
-        )
-      } else if (accountType === 'bedrock') {
-        // Bedrock账号使用Bedrock转发服务
-        try {
-          const bedrockAccountResult = await bedrockAccountService.getAccount(accountId)
-          if (!bedrockAccountResult.success) {
-            throw new Error('Failed to get Bedrock account details')
-          }
-
-          const result = await bedrockRelayService.handleNonStreamRequest(
-            req.body,
-            bedrockAccountResult.data,
-            req.headers
-          )
-
-          // 构建标准响应格式
-          response = {
-            statusCode: result.success ? 200 : 500,
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(result.success ? result.data : { error: result.error }),
-            accountId
-          }
-
-          // 如果成功，添加使用统计到响应数据中
-          if (result.success && result.usage) {
-            const responseData = JSON.parse(response.body)
-            responseData.usage = result.usage
-            response.body = JSON.stringify(responseData)
-          }
-        } catch (error) {
-          logger.error('❌ Bedrock non-stream request failed:', error)
-          response = {
-            statusCode: 500,
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ error: 'Bedrock service error', message: error.message }),
-            accountId
-          }
-        }
-      }
+      // 使用新的重试功能处理非流式请求（支持Claude Official和Console）
+      const response = await claudeRelayService.relayNonStreamRequestWithRetry(
+        req.body,
+        req.apiKey,
+        req,
+        res,
+        req.headers
+      )
 
       logger.info('📡 Claude API response received', {
         statusCode: response.statusCode,

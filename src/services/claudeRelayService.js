@@ -1935,6 +1935,238 @@ class ClaudeRelayService {
     }
   }
 
+  // 🔄 带重试功能的非流式请求处理（新增功能）
+  async relayNonStreamRequestWithRetry(requestBody, apiKeyData, req, res, clientHeaders) {
+    let retryContext = null
+    let finalError = null
+
+    try {
+      logger.info(`🔄 Starting non-stream request with retry for key: ${apiKeyData.name}`)
+
+      // 创建重试上下文
+      retryContext = requestRetryService.createRetryContext(
+        { body: requestBody, headers: clientHeaders },
+        apiKeyData,
+        sessionHelper.generateSessionHash(requestBody)
+      )
+
+      while (requestRetryService.canRetry(retryContext)) {
+        try {
+          // 选择账户（排除之前失败的账户）
+          const accountSelection = await unifiedClaudeScheduler.selectAccountForApiKey(
+            apiKeyData,
+            retryContext.sessionHash,
+            requestBody.model,
+            { excludeAccounts: retryContext.excludedAccounts }
+          )
+
+          const { accountId, accountType } = accountSelection
+          logger.info(
+            `🎯 Attempt ${retryContext.attemptNumber + 1}: Using account ${accountId} (${accountType})`
+          )
+
+          // 尝试发送请求
+          const result = await this._attemptNonStreamRequest(
+            requestBody,
+            accountId,
+            accountType,
+            req,
+            res,
+            clientHeaders,
+            retryContext
+          )
+
+          if (result.success) {
+            // 请求成功，更新上下文并返回
+            requestRetryService.updateRetryContext(retryContext, accountId, accountType)
+            requestRetryService.logRetryCompletion(retryContext, true)
+            return result.response
+          } else {
+            // 请求失败，分析错误并决定是否重试
+            const errorAnalysis = requestRetryService.analyzeError(result.error, result.statusCode)
+
+            if (!errorAnalysis.isRetryable) {
+              logger.info(`❌ Error is not retryable: ${errorAnalysis.errorType}`)
+              finalError = result.error
+              break
+            }
+
+            // 更新重试上下文
+            requestRetryService.updateRetryContext(
+              retryContext,
+              accountId,
+              accountType,
+              result.error
+            )
+
+            // 标记账户为临时不可用
+            if (requestRetryService.shouldMarkAccountTemporarilyUnavailable(errorAnalysis)) {
+              const duration = requestRetryService.getAccountUnavailableDuration(errorAnalysis)
+              await unifiedClaudeScheduler.markAccountTemporarilyUnavailable(
+                accountId,
+                accountType,
+                duration
+              )
+              logger.warn(
+                `🚫 Marked account ${accountId} as temporarily unavailable for ${duration}s`
+              )
+            }
+
+            // 如果还有重试机会，等待后重试
+            if (requestRetryService.canRetry(retryContext)) {
+              const delay = requestRetryService.calculateRetryDelay(retryContext.attemptNumber)
+              logger.info(`⏱️ Waiting ${delay}ms before retry ${retryContext.attemptNumber + 1}`)
+              await requestRetryService.delay(delay)
+            }
+          }
+        } catch (attemptError) {
+          logger.error(`❌ Attempt ${retryContext.attemptNumber + 1} error:`, attemptError)
+          finalError = attemptError
+
+          // 如果是选择账户失败，可能没有可用账户了
+          if (attemptError.message.includes('No available')) {
+            logger.error('❌ No more available accounts for retry')
+            break
+          }
+        }
+      }
+
+      // 重试全部失败
+      requestRetryService.logRetryCompletion(retryContext, false)
+      throw finalError || new Error('All retry attempts failed')
+    } catch (error) {
+      logger.error('❌ Non-stream request with retry failed:', error)
+
+      if (retryContext) {
+        requestRetryService.logRetryCompletion(retryContext, false)
+      }
+
+      // 返回错误响应
+      if (!res.headersSent) {
+        return res.status(503).json({
+          error: {
+            type: 'service_error',
+            message: 'Request failed after all retry attempts'
+          }
+        })
+      }
+
+      throw error
+    }
+  }
+
+  // 🎯 尝试单次非流式请求
+  async _attemptNonStreamRequest(
+    requestBody,
+    accountId,
+    accountType,
+    req,
+    res,
+    clientHeaders,
+    retryContext
+  ) {
+    try {
+      let response = null
+
+      if (accountType === 'claude-official') {
+        // Claude官方账户
+        const accessToken = await claudeAccountService.getValidAccessToken(accountId)
+        const processedBody = this._processRequestBody(requestBody, clientHeaders)
+        const proxyAgent = await this._getProxyAgent(accountId)
+
+        response = await this._makeClaudeNonStreamRequest(
+          processedBody,
+          accessToken,
+          proxyAgent,
+          clientHeaders,
+          accountId
+        )
+      } else if (accountType === 'claude-console') {
+        // Claude Console账户
+        const claudeConsoleRelayService = require('./claudeConsoleRelayService')
+        response = await claudeConsoleRelayService.relayRequest(
+          requestBody,
+          retryContext.apiKeyInfo, // 使用重试上下文中的API Key信息
+          req,
+          res,
+          clientHeaders,
+          accountId
+        )
+      } else {
+        throw new Error(`Unsupported account type for non-stream retry: ${accountType}`)
+      }
+
+      return {
+        success: true,
+        response,
+        accountId,
+        accountType
+      }
+    } catch (error) {
+      // 从错误中提取状态码
+      let statusCode = null
+      if (error.response && error.response.status) {
+        statusCode = error.response.status
+      } else if (error.status) {
+        statusCode = error.status
+      } else if (error.message && error.message.includes('HTTP ')) {
+        const match = error.message.match(/HTTP (\d+)/)
+        if (match) {
+          statusCode = parseInt(match[1])
+        }
+      }
+
+      return {
+        success: false,
+        error,
+        statusCode,
+        accountId,
+        accountType
+      }
+    }
+  }
+
+  // 🎯 发送非流式请求到Claude API
+  async _makeClaudeNonStreamRequest(body, accessToken, proxyAgent, clientHeaders, accountId) {
+    return new Promise((resolve, reject) => {
+      this._makeClaudeRequest(
+        body,
+        accessToken,
+        proxyAgent,
+        clientHeaders,
+        accountId,
+        (request) => {
+          request.on('response', (response) => {
+            let data = ''
+
+            response.on('data', (chunk) => {
+              data += chunk.toString()
+            })
+
+            response.on('end', () => {
+              try {
+                if (response.statusCode >= 400) {
+                  const error = new Error(`HTTP ${response.statusCode}`)
+                  error.status = response.statusCode
+                  error.response = { status: response.statusCode, data }
+                  reject(error)
+                } else {
+                  resolve(JSON.parse(data))
+                }
+              } catch (parseError) {
+                reject(parseError)
+              }
+            })
+          })
+
+          request.on('error', (error) => {
+            reject(error)
+          })
+        }
+      )
+    })
+  }
+
   // 🎯 健康检查
   async healthCheck() {
     try {
