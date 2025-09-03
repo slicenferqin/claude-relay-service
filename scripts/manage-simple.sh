@@ -82,7 +82,7 @@ delete_instance() {
     local i=1
     while IFS='|' read -r name dir port redis_host redis_port; do
         [ -z "$name" ] && continue
-        echo "  $i. $name"
+        echo "  $i. $name (端口: $port)"
         i=$((i+1))
     done < "$CONFIG_FILE"
     
@@ -95,18 +95,28 @@ delete_instance() {
         return 1
     fi
     
-    # 获取要删除的实例
-    local target_name=$(sed -n "${choice}p" "$CONFIG_FILE" | cut -d'|' -f1)
-    
-    if [ -z "$target_name" ]; then
+    # 获取要删除的实例信息
+    local instance_info=$(sed -n "${choice}p" "$CONFIG_FILE")
+    if [ -z "$instance_info" ]; then
         echo -e "${RED}无效的选择${NC}"
         return 1
     fi
     
+    IFS='|' read -r target_name dir port redis_host redis_port <<< "$instance_info"
+    
+    echo -e "${YELLOW}警告：删除实例将会：${NC}"
+    echo "1. 停止正在运行的服务"
+    echo "2. 删除实例配置"
+    echo "3. 不会删除安装目录和数据"
+    echo
     echo -n "确认删除 $target_name? (输入 DELETE 确认): "
     read confirm
     
     if [ "$confirm" = "DELETE" ]; then
+        # 先停止实例
+        echo "正在停止实例 $target_name..."
+        stop_instance_by_name "$target_name" "$port"
+        
         # 删除配置
         grep -v "^$target_name|" "$CONFIG_FILE" > "$CONFIG_FILE.tmp"
         mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
@@ -193,6 +203,91 @@ start_instance() {
     echo "=============================="
 }
 
+# 函数：通过名称和端口停止实例（内部使用）
+stop_instance_by_name() {
+    local name="$1"
+    local port="$2"
+    local force_kill="${3:-false}"
+    
+    local stopped=false
+    
+    # 方法1: 通过PID文件停止
+    if [ -f "/tmp/crs-$name.pid" ]; then
+        local pid=$(cat /tmp/crs-$name.pid)
+        if kill -0 $pid 2>/dev/null; then
+            if [ "$force_kill" = "true" ]; then
+                kill -9 $pid 2>/dev/null
+            else
+                kill $pid 2>/dev/null
+            fi
+            sleep 2
+            if ! kill -0 $pid 2>/dev/null; then
+                echo "  ✓ 已通过PID ($pid) 停止进程"
+                rm -f /tmp/crs-$name.pid
+                stopped=true
+            fi
+        else
+            rm -f /tmp/crs-$name.pid
+        fi
+    fi
+    
+    # 方法2: 通过端口查找进程（使用netstat，更通用）
+    if [ "$stopped" = "false" ]; then
+        echo "  尝试通过端口 $port 查找进程..."
+        local pids=$(netstat -tlnp 2>/dev/null | grep ":$port " | awk '{print $7}' | cut -d'/' -f1 | grep -v '^-$' | sort -u)
+        if [ -n "$pids" ]; then
+            for pid in $pids; do
+                if [ -n "$pid" ] && kill -0 $pid 2>/dev/null; then
+                    # 检查是否是node进程
+                    if ps -p $pid -o comm= 2>/dev/null | grep -q "node"; then
+                        if [ "$force_kill" = "true" ]; then
+                            kill -9 $pid 2>/dev/null
+                        else
+                            kill $pid 2>/dev/null
+                        fi
+                        echo "  ✓ 已停止端口 $port 上的node进程 (PID: $pid)"
+                        stopped=true
+                    fi
+                fi
+            done
+        fi
+    fi
+    
+    # 方法3: 如果有lsof命令，使用lsof（备用方案）
+    if [ "$stopped" = "false" ] && command -v lsof >/dev/null 2>&1; then
+        local pids=$(lsof -t -i:$port 2>/dev/null)
+        if [ -n "$pids" ]; then
+            for pid in $pids; do
+                if [ -n "$pid" ] && kill -0 $pid 2>/dev/null; then
+                    if [ "$force_kill" = "true" ]; then
+                        kill -9 $pid 2>/dev/null
+                    else
+                        kill $pid 2>/dev/null
+                    fi
+                    echo "  ✓ 已停止端口 $port 上的进程 (PID: $pid)"
+                    stopped=true
+                fi
+            done
+        fi
+    fi
+    
+    # 等待确认停止
+    if [ "$stopped" = "true" ]; then
+        sleep 1
+        # 再次检查端口是否真的被释放
+        if netstat -tln 2>/dev/null | grep -q ":$port "; then
+            echo "  ⚠ 端口 $port 仍被占用"
+            return 1
+        else
+            echo "  ✓ 端口 $port 已释放"
+            return 0
+        fi
+    else
+        echo "  ✗ 没有找到运行在端口 $port 的进程"
+        return 1
+    fi
+}
+
 # 函数：停止实例
 stop_instance() {
     echo "========== 停止实例 =========="
@@ -207,7 +302,7 @@ stop_instance() {
     local i=1
     while IFS='|' read -r name dir port redis_host redis_port; do
         [ -z "$name" ] && continue
-        echo "  $i. $name"
+        echo "  $i. $name (端口: $port)"
         i=$((i+1))
     done < "$CONFIG_FILE"
     
@@ -223,26 +318,23 @@ stop_instance() {
     
     IFS='|' read -r name dir port redis_host redis_port <<< "$instance_info"
     
-    # 尝试通过PID文件停止
-    if [ -f "/tmp/crs-$name.pid" ]; then
-        local pid=$(cat /tmp/crs-$name.pid)
-        if kill -0 $pid 2>/dev/null; then
-            kill $pid
-            echo -e "${GREEN}实例 $name 已停止${NC}"
-            rm -f /tmp/crs-$name.pid
-        else
-            echo "PID $pid 不存在"
-        fi
+    echo "停止实例: $name (端口: $port)"
+    
+    # 尝试正常停止
+    if stop_instance_by_name "$name" "$port"; then
+        echo -e "${GREEN}实例 $name 已成功停止${NC}"
     else
-        echo "没有找到PID文件"
-        # 尝试通过端口查找
-        echo "尝试通过端口 $port 查找进程..."
-        local pids=$(lsof -t -i:$port 2>/dev/null)
-        if [ -n "$pids" ]; then
-            kill $pids
-            echo -e "${GREEN}已停止端口 $port 上的进程${NC}"
+        echo -e "${YELLOW}正常停止失败，是否强制停止？ (y/N): ${NC}"
+        read force_confirm
+        if [ "$force_confirm" = "y" ] || [ "$force_confirm" = "Y" ]; then
+            echo "强制停止实例..."
+            if stop_instance_by_name "$name" "$port" "true"; then
+                echo -e "${GREEN}实例 $name 已强制停止${NC}"
+            else
+                echo -e "${RED}强制停止失败，请检查系统状态${NC}"
+            fi
         else
-            echo "没有找到运行的进程"
+            echo -e "${RED}停止操作已取消${NC}"
         fi
     fi
     
