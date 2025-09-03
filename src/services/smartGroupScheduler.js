@@ -22,8 +22,16 @@ class SmartGroupScheduler {
     requestedModel = null,
     requestContext = {}
   ) {
+    const { excludeAccounts = [] } = requestContext
     try {
       logger.info(`🎯 Smart group scheduling for group: ${groupId}`)
+
+      // 记录排除的账户
+      if (excludeAccounts.length > 0) {
+        logger.info(
+          `🚫 Excluding ${excludeAccounts.length} accounts: ${excludeAccounts.join(', ')}`
+        )
+      }
 
       // 获取分组信息
       const group = await accountGroupService.getGroup(groupId)
@@ -44,8 +52,12 @@ class SmartGroupScheduler {
         }
       }
 
-      // 获取分组内健康的账户
-      const healthyAccounts = await this.getHealthyAccountsInGroup(groupId, requestedModel)
+      // 获取分组内健康的账户（排除指定账户）
+      const healthyAccounts = await this.getHealthyAccountsInGroup(
+        groupId,
+        requestedModel,
+        excludeAccounts
+      )
 
       if (healthyAccounts.length > 0) {
         // 从健康账户中选择
@@ -69,7 +81,11 @@ class SmartGroupScheduler {
 
       // 分组内无健康账户，尝试使用后备账户
       logger.warn(`⚠️ No healthy accounts in group ${group.name}, trying fallback`)
-      const fallbackAccount = await this.getFallbackAccount(group.platform, requestedModel)
+      const fallbackAccount = await this.getFallbackAccount(
+        group.platform,
+        requestedModel,
+        excludeAccounts
+      )
 
       if (fallbackAccount) {
         // 建立临时会话映射到后备账户
@@ -158,12 +174,18 @@ class SmartGroupScheduler {
   }
 
   // 🏥 获取分组内健康的账户
-  async getHealthyAccountsInGroup(groupId, requestedModel = null) {
+  async getHealthyAccountsInGroup(groupId, requestedModel = null, excludeAccounts = []) {
     try {
       const memberIds = await accountGroupService.getGroupMembers(groupId)
       const healthyAccounts = []
 
       for (const memberId of memberIds) {
+        // 跳过被排除的账户
+        if (excludeAccounts.includes(memberId)) {
+          logger.debug(`🚫 Skipping excluded account: ${memberId}`)
+          continue
+        }
+
         const account = await this.getAccountDetails(memberId)
         if (!account) {
           continue
@@ -236,7 +258,7 @@ class SmartGroupScheduler {
   }
 
   // 🔄 获取后备账户
-  async getFallbackAccount(platform, requestedModel = null) {
+  async getFallbackAccount(platform, requestedModel = null, excludeAccounts = []) {
     try {
       const client = redis.getClientSafe()
       const fallbackKey = `${this.FALLBACK_ACCOUNT_PREFIX}${platform}`
@@ -256,10 +278,14 @@ class SmartGroupScheduler {
 
       // 如果没有配置后备账户，自动选择一个健康的共享账户
       if (!fallbackAccountId) {
-        fallbackAccountId = await this.autoSelectFallbackAccount(platform, requestedModel)
+        fallbackAccountId = await this.autoSelectFallbackAccount(
+          platform,
+          requestedModel,
+          excludeAccounts
+        )
       }
 
-      if (fallbackAccountId) {
+      if (fallbackAccountId && !excludeAccounts.includes(fallbackAccountId)) {
         const account = await this.getAccountDetails(fallbackAccountId)
         if (account && (await this.isAccountAvailable(account))) {
           const healthStatus = await accountHealthService.getAccountHealthStatus(fallbackAccountId)
@@ -268,6 +294,28 @@ class SmartGroupScheduler {
             return {
               ...account,
               accountId: fallbackAccountId
+            }
+          }
+        }
+      } else if (fallbackAccountId && excludeAccounts.includes(fallbackAccountId)) {
+        logger.warn(
+          `⚠️ Configured fallback account ${fallbackAccountId} is in exclude list, trying auto-selection`
+        )
+        // 如果配置的后备账户被排除，尝试自动选择
+        const autoSelectedId = await this.autoSelectFallbackAccount(
+          platform,
+          requestedModel,
+          excludeAccounts
+        )
+        if (autoSelectedId) {
+          const account = await this.getAccountDetails(autoSelectedId)
+          if (account && (await this.isAccountAvailable(account))) {
+            const healthStatus = await accountHealthService.getAccountHealthStatus(autoSelectedId)
+            if (healthStatus.healthy && !healthStatus.quarantined) {
+              return {
+                ...account,
+                accountId: autoSelectedId
+              }
             }
           }
         }
@@ -281,7 +329,7 @@ class SmartGroupScheduler {
   }
 
   // 🤖 自动选择后备账户
-  async autoSelectFallbackAccount(platform, requestedModel = null) {
+  async autoSelectFallbackAccount(platform, requestedModel = null, excludeAccounts = []) {
     try {
       let accounts = []
 
@@ -346,6 +394,11 @@ class SmartGroupScheduler {
 
       // 选择健康的账户作为后备
       for (const account of accounts) {
+        // 跳过被排除的账户
+        if (excludeAccounts.includes(account.accountId)) {
+          continue
+        }
+
         const healthStatus = await accountHealthService.getAccountHealthStatus(account.accountId)
         if (healthStatus.healthy && !healthStatus.quarantined) {
           // 检查模型支持

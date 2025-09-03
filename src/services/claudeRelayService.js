@@ -5,6 +5,7 @@ const path = require('path')
 const ProxyHelper = require('../utils/proxyHelper')
 const claudeAccountService = require('./claudeAccountService')
 const unifiedClaudeScheduler = require('./unifiedClaudeScheduler')
+const requestRetryService = require('./requestRetryService')
 const sessionHelper = require('../utils/sessionHelper')
 const logger = require('../utils/logger')
 const config = require('../../config/config')
@@ -1667,6 +1668,270 @@ class ClaudeRelayService {
     } catch (error) {
       logger.error('🆘💥 Fallback account error:', error)
       return null
+    }
+  }
+
+  // 🔄 带重试功能的流式请求处理（新增功能）
+  async relayStreamRequestWithRetry(
+    requestBody,
+    apiKeyData,
+    responseStream,
+    clientHeaders,
+    usageCallback
+  ) {
+    let retryContext = null
+    let finalError = null
+
+    try {
+      logger.info(`🔄 Starting stream request with retry for key: ${apiKeyData.name}`)
+
+      // 创建重试上下文
+      retryContext = requestRetryService.createRetryContext(
+        { body: requestBody, headers: clientHeaders },
+        apiKeyData,
+        sessionHelper.generateSessionHash(requestBody)
+      )
+
+      while (requestRetryService.canRetry(retryContext)) {
+        try {
+          // 选择账户（排除之前失败的账户）
+          const accountSelection = await unifiedClaudeScheduler.selectAccountForApiKey(
+            apiKeyData,
+            retryContext.sessionHash,
+            requestBody.model,
+            { excludeAccounts: retryContext.excludedAccounts }
+          )
+
+          const { accountId, accountType } = accountSelection
+          logger.info(
+            `🎯 Attempt ${retryContext.attemptNumber + 1}: Using account ${accountId} (${accountType})`
+          )
+
+          // 尝试发送请求
+          const result = await this._attemptStreamRequest(
+            requestBody,
+            accountId,
+            accountType,
+            responseStream,
+            clientHeaders,
+            usageCallback
+          )
+
+          if (result.success) {
+            // 请求成功，更新上下文并返回
+            requestRetryService.updateRetryContext(retryContext, accountId, accountType)
+            requestRetryService.logRetryCompletion(retryContext, true)
+            return result
+          } else {
+            // 请求失败，分析错误并决定是否重试
+            const errorAnalysis = requestRetryService.analyzeError(result.error, result.statusCode)
+
+            if (!errorAnalysis.isRetryable) {
+              logger.info(`❌ Error is not retryable: ${errorAnalysis.errorType}`)
+              finalError = result.error
+              break
+            }
+
+            // 更新重试上下文
+            requestRetryService.updateRetryContext(
+              retryContext,
+              accountId,
+              accountType,
+              result.error
+            )
+
+            // 标记账户为临时不可用
+            if (requestRetryService.shouldMarkAccountTemporarilyUnavailable(errorAnalysis)) {
+              const duration = requestRetryService.getAccountUnavailableDuration(errorAnalysis)
+              await unifiedClaudeScheduler.markAccountTemporarilyUnavailable(
+                accountId,
+                accountType,
+                duration
+              )
+              logger.warn(
+                `🚫 Marked account ${accountId} as temporarily unavailable for ${duration}s`
+              )
+            }
+
+            // 如果还有重试机会，等待后重试
+            if (requestRetryService.canRetry(retryContext)) {
+              const delay = requestRetryService.calculateRetryDelay(retryContext.attemptNumber)
+              logger.info(`⏱️ Waiting ${delay}ms before retry ${retryContext.attemptNumber + 1}`)
+              await requestRetryService.delay(delay)
+            }
+          }
+        } catch (attemptError) {
+          logger.error(`❌ Attempt ${retryContext.attemptNumber + 1} error:`, attemptError)
+          finalError = attemptError
+
+          // 如果是选择账户失败，可能没有可用账户了
+          if (attemptError.message.includes('No available')) {
+            logger.error('❌ No more available accounts for retry')
+            break
+          }
+        }
+      }
+
+      // 重试全部失败
+      requestRetryService.logRetryCompletion(retryContext, false)
+      throw finalError || new Error('All retry attempts failed')
+    } catch (error) {
+      logger.error('❌ Stream request with retry failed:', error)
+
+      if (retryContext) {
+        requestRetryService.logRetryCompletion(retryContext, false)
+      }
+
+      // 返回错误响应
+      if (!responseStream.headersSent) {
+        const errorResponse = JSON.stringify({
+          error: {
+            type: 'service_error',
+            message: 'Request failed after all retry attempts'
+          }
+        })
+
+        responseStream.writeHead(503, { 'Content-Type': 'application/json' })
+        responseStream.end(errorResponse)
+      }
+
+      throw error
+    }
+  }
+
+  // 🎯 尝试单次流式请求
+  async _attemptStreamRequest(
+    requestBody,
+    accountId,
+    accountType,
+    responseStream,
+    clientHeaders,
+    usageCallback
+  ) {
+    try {
+      // 获取有效的访问token
+      const accessToken = await claudeAccountService.getValidAccessToken(accountId)
+
+      // 处理请求体
+      const processedBody = this._processRequestBody(requestBody, clientHeaders)
+
+      // 获取代理配置
+      const proxyAgent = await this._getProxyAgent(accountId)
+
+      // 创建一个承诺来捕获流的结果
+      return new Promise((resolve, _reject) => {
+        let hasResolved = false
+        let buffer = ''
+        let usageDataCaptured = false
+
+        const cleanup = () => {
+          if (hasResolved) {
+            return
+          }
+          hasResolved = true
+        }
+
+        // 发送请求
+        this._makeClaudeRequest(
+          processedBody,
+          accessToken,
+          proxyAgent,
+          clientHeaders,
+          accountId,
+          (request) => {
+            request.on('response', (response) => {
+              logger.debug(`📡 Response status: ${response.statusCode}`)
+
+              // 检查响应状态
+              if (response.statusCode >= 400) {
+                cleanup()
+                resolve({
+                  success: false,
+                  statusCode: response.statusCode,
+                  error: new Error(`HTTP ${response.statusCode}`)
+                })
+                return
+              }
+
+              // 设置响应头
+              if (!responseStream.headersSent) {
+                responseStream.writeHead(response.statusCode, {
+                  'Content-Type': 'text/event-stream',
+                  'Cache-Control': 'no-cache',
+                  Connection: 'keep-alive',
+                  'Access-Control-Allow-Origin': '*'
+                })
+              }
+
+              // 处理流数据
+              response.on('data', (chunk) => {
+                try {
+                  const chunkStr = chunk.toString()
+                  buffer += chunkStr
+
+                  // 转发数据到客户端
+                  responseStream.write(chunk)
+
+                  // 尝试解析usage数据
+                  const lines = buffer.split('\n')
+                  for (const line of lines) {
+                    if (line.startsWith('data: ')) {
+                      try {
+                        const data = JSON.parse(line.slice(6))
+                        if (data.usage && !usageDataCaptured) {
+                          usageCallback({ ...data.usage, accountId })
+                          usageDataCaptured = true
+                        }
+                      } catch (e) {
+                        // 忽略解析错误
+                      }
+                    }
+                  }
+                } catch (error) {
+                  logger.error('❌ Error processing stream data:', error)
+                }
+              })
+
+              response.on('end', () => {
+                cleanup()
+                responseStream.end()
+                resolve({ success: true, usageDataCaptured })
+              })
+
+              response.on('error', (error) => {
+                cleanup()
+                resolve({
+                  success: false,
+                  error,
+                  statusCode: response.statusCode
+                })
+              })
+            })
+
+            request.on('error', (error) => {
+              cleanup()
+              resolve({
+                success: false,
+                error,
+                statusCode: null
+              })
+            })
+          }
+        ).catch((error) => {
+          cleanup()
+          resolve({
+            success: false,
+            error,
+            statusCode: null
+          })
+        })
+      })
+    } catch (error) {
+      return {
+        success: false,
+        error,
+        statusCode: null
+      }
     }
   }
 

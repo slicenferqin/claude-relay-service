@@ -49,41 +49,51 @@ class UnifiedClaudeScheduler {
             requestedModel,
             {
               apiKeyName: apiKeyData.name,
-              apiKeyId: apiKeyData.id
+              apiKeyId: apiKeyData.id,
+              excludeAccounts // 传递排除账户列表
             }
           )
         }
 
-        // 普通专属账户 - 先检查健康状态
-        const boundAccount = await redis.getClaudeAccount(apiKeyData.claudeAccountId)
-        if (boundAccount && boundAccount.isActive === 'true' && boundAccount.status !== 'error') {
-          // 检查账户健康状态
-          const healthStatus = await accountHealthService.getAccountHealthStatus(
-            apiKeyData.claudeAccountId
-          )
-
-          if (healthStatus.healthy && !healthStatus.quarantined) {
-            logger.info(
-              `🎯 Using bound dedicated Claude OAuth account: ${boundAccount.name} (${apiKeyData.claudeAccountId}) for API key ${apiKeyData.name}`
+        // 普通专属账户 - 先检查是否在排除列表中
+        if (!excludeAccounts.includes(apiKeyData.claudeAccountId)) {
+          const boundAccount = await redis.getClaudeAccount(apiKeyData.claudeAccountId)
+          if (boundAccount && boundAccount.isActive === 'true' && boundAccount.status !== 'error') {
+            // 检查账户健康状态
+            const healthStatus = await accountHealthService.getAccountHealthStatus(
+              apiKeyData.claudeAccountId
             )
-            return {
-              accountId: apiKeyData.claudeAccountId,
-              accountType: 'claude-official'
+
+            if (healthStatus.healthy && !healthStatus.quarantined) {
+              logger.info(
+                `🎯 Using bound dedicated Claude OAuth account: ${boundAccount.name} (${apiKeyData.claudeAccountId}) for API key ${apiKeyData.name}`
+              )
+              return {
+                accountId: apiKeyData.claudeAccountId,
+                accountType: 'claude-official'
+              }
+            } else {
+              logger.warn(
+                `⚠️ Bound Claude OAuth account ${apiKeyData.claudeAccountId} is unhealthy (${healthStatus.error || 'quarantined'}), falling back to pool`
+              )
             }
           } else {
             logger.warn(
-              `⚠️ Bound Claude OAuth account ${apiKeyData.claudeAccountId} is unhealthy (${healthStatus.error || 'quarantined'}), falling back to pool`
+              `⚠️ Bound Claude OAuth account ${apiKeyData.claudeAccountId} is not available, falling back to pool`
             )
           }
         } else {
           logger.warn(
-            `⚠️ Bound Claude OAuth account ${apiKeyData.claudeAccountId} is not available, falling back to pool`
+            `⚠️ Bound Claude OAuth account ${apiKeyData.claudeAccountId} is in exclude list, falling back to pool`
           )
         }
       }
 
       // 2. 检查Claude Console账户绑定
-      if (apiKeyData.claudeConsoleAccountId) {
+      if (
+        apiKeyData.claudeConsoleAccountId &&
+        !excludeAccounts.includes(apiKeyData.claudeConsoleAccountId)
+      ) {
         const boundConsoleAccount = await claudeConsoleAccountService.getAccount(
           apiKeyData.claudeConsoleAccountId
         )
@@ -104,10 +114,17 @@ class UnifiedClaudeScheduler {
             `⚠️ Bound Claude Console account ${apiKeyData.claudeConsoleAccountId} is not available, falling back to pool`
           )
         }
+      } else if (
+        apiKeyData.claudeConsoleAccountId &&
+        excludeAccounts.includes(apiKeyData.claudeConsoleAccountId)
+      ) {
+        logger.warn(
+          `⚠️ Bound Claude Console account ${apiKeyData.claudeConsoleAccountId} is in exclude list, falling back to pool`
+        )
       }
 
       // 3. 检查Bedrock账户绑定
-      if (apiKeyData.bedrockAccountId) {
+      if (apiKeyData.bedrockAccountId && !excludeAccounts.includes(apiKeyData.bedrockAccountId)) {
         const boundBedrockAccountResult = await bedrockAccountService.getAccount(
           apiKeyData.bedrockAccountId
         )
@@ -124,6 +141,13 @@ class UnifiedClaudeScheduler {
             `⚠️ Bound Bedrock account ${apiKeyData.bedrockAccountId} is not available, falling back to pool`
           )
         }
+      } else if (
+        apiKeyData.bedrockAccountId &&
+        excludeAccounts.includes(apiKeyData.bedrockAccountId)
+      ) {
+        logger.warn(
+          `⚠️ Bound Bedrock account ${apiKeyData.bedrockAccountId} is in exclude list, falling back to pool`
+        )
       }
 
       // 如果有会话哈希，检查是否有已映射的账户
