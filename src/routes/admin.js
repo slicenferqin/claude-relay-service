@@ -2281,9 +2281,11 @@ router.delete('/claude-console-accounts/:accountId', authenticateAdmin, async (r
     // 获取账户信息以检查是否在分组中
     const account = await claudeConsoleAccountService.getAccount(accountId)
     if (account && account.accountType === 'group') {
-      const groups = await accountGroupService.getAccountGroup(accountId)
-      for (const group of groups) {
-        await accountGroupService.removeAccountFromGroup(accountId, group.id)
+      const groups = await accountGroupService.getAccountGroups(accountId)
+      if (groups && Array.isArray(groups)) {
+        for (const group of groups) {
+          await accountGroupService.removeAccountFromGroup(accountId, group.id)
+        }
       }
     }
 
