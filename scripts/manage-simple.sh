@@ -182,23 +182,51 @@ start_instance() {
         fi
     fi
     
-    # 简单的启动命令
+    # 启动命令（获取真实的Node.js PID）
     echo "正在启动..."
+    
+    # 先启动服务
     nohup npm start > /tmp/crs-$name.log 2>&1 &
-    local pid=$!
-    echo $pid > /tmp/crs-$name.pid
+    local npm_pid=$!
     
+    # 等待Node.js进程启动并获取真实PID
     sleep 3
+    local node_pid=""
     
-    if kill -0 $pid 2>/dev/null; then
-        echo -e "${GREEN}实例 $name 已启动 (PID: $pid)${NC}"
+    # 尝试通过端口找到Node.js进程
+    for i in {1..5}; do
+        node_pid=$(netstat -tlnp 2>/dev/null | grep ":$port " | awk '{print $7}' | cut -d'/' -f1 | head -1)
+        if [ -n "$node_pid" ] && [ "$node_pid" != "-" ]; then
+            break
+        fi
+        sleep 1
+    done
+    
+    # 如果通过端口找不到，尝试通过进程树查找
+    if [ -z "$node_pid" ] || [ "$node_pid" = "-" ]; then
+        node_pid=$(pgrep -P $npm_pid node 2>/dev/null | head -1)
+    fi
+    
+    # 保存真实的Node.js PID或npm PID
+    if [ -n "$node_pid" ] && [ "$node_pid" != "-" ]; then
+        echo $node_pid > /tmp/crs-$name.pid
+        echo -e "${GREEN}实例 $name 已启动 (Node.js PID: $node_pid, npm PID: $npm_pid)${NC}"
+    else
+        echo $npm_pid > /tmp/crs-$name.pid
+        echo -e "${YELLOW}实例 $name 已启动 (npm PID: $npm_pid, 无法获取Node.js PID)${NC}"
+    fi
+    
+    # 验证服务是否正常运行
+    if netstat -tln 2>/dev/null | grep -q ":$port "; then
+        echo -e "${GREEN}✓ 服务正在监听端口 $port${NC}"
         echo "访问地址: http://localhost:$port/admin-next/"
         echo "API地址: http://localhost:$port/api"
-        echo "日志文件: /tmp/crs-$name.log"
     else
-        echo -e "${RED}启动失败${NC}"
-        echo "查看日志: tail -f /tmp/crs-$name.log"
+        echo -e "${RED}✗ 服务未能监听端口 $port${NC}"
+        echo "请检查日志: tail -f /tmp/crs-$name.log"
     fi
+    
+    echo "日志文件: /tmp/crs-$name.log"
     
     echo "=============================="
 }
