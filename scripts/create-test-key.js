@@ -1,17 +1,17 @@
 #!/usr/bin/env node
 
 const apiKeyService = require('../src/services/apiKeyService')
-const logger = require('../src/utils/logger')
+const _logger = require('../src/utils/logger')
 const redis = require('../src/models/redis')
 
 async function createTestKey() {
   try {
     console.log('Creating test API key...')
-    
+
     // 先连接Redis
     await redis.connect()
     console.log('Connected to Redis')
-    
+
     // 创建测试用的API Key
     const result = await apiKeyService.generateApiKey({
       name: 'Test Failover Key',
@@ -28,8 +28,9 @@ async function createTestKey() {
     console.log(`curl -X POST http://localhost:3000/api/v1/messages \\`)
     console.log(`  -H "Authorization: Bearer ${result.apiKey}" \\`)
     console.log(`  -H "Content-Type: application/json" \\`)
-    console.log(`  -d '{"model": "claude-3-5-sonnet-20241022", "messages": [{"role": "user", "content": "Hello!"}], "max_tokens": 50}'`)
-
+    console.log(
+      `  -d '{"model": "claude-3-5-sonnet-20241022", "messages": [{"role": "user", "content": "Hello!"}], "max_tokens": 50}'`
+    )
   } catch (error) {
     console.error('❌ Failed to create test key:', error)
     process.exit(1)

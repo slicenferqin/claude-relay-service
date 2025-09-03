@@ -127,7 +127,7 @@ async function handleMessagesRequest(req, res) {
             // 更新时间窗口内的token计数和费用
             if (req.rateLimitInfo) {
               const totalTokens = inputTokens + outputTokens + cacheCreateTokens + cacheReadTokens
-              
+
               // 更新Token计数（向后兼容）
               redis
                 .getClient()
@@ -243,16 +243,18 @@ async function handleMessagesRequest(req, res) {
           // 更新时间窗口内的token计数和费用
           if (req.rateLimitInfo) {
             const totalTokens = inputTokens + outputTokens + cacheCreateTokens + cacheReadTokens
-            
+
             // 更新Token计数（向后兼容）
             await redis.getClient().incrby(req.rateLimitInfo.tokenCountKey, totalTokens)
             logger.api(`📊 Updated rate limit token count: +${totalTokens} tokens`)
 
             // 计算并更新费用计数（新功能）
             if (req.rateLimitInfo.costCountKey) {
-              const costInfo = pricingService.calculateCost(result.usage, result.model)
+              const costInfo = pricingService.calculateCost(jsonData.usage, model)
               if (costInfo.totalCost > 0) {
-                await redis.getClient().incrbyfloat(req.rateLimitInfo.costCountKey, costInfo.totalCost)
+                await redis
+                  .getClient()
+                  .incrbyfloat(req.rateLimitInfo.costCountKey, costInfo.totalCost)
                 logger.api(`💰 Updated rate limit cost count: +$${costInfo.totalCost.toFixed(6)}`)
               }
             }
