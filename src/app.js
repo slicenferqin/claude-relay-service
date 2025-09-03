@@ -22,6 +22,7 @@ const geminiRoutes = require('./routes/geminiRoutes')
 const openaiGeminiRoutes = require('./routes/openaiGeminiRoutes')
 const openaiClaudeRoutes = require('./routes/openaiClaudeRoutes')
 const openaiRoutes = require('./routes/openaiRoutes')
+const userRoutes = require('./routes/userRoutes')
 const azureOpenaiRoutes = require('./routes/azureOpenaiRoutes')
 const webhookRoutes = require('./routes/webhook')
 const accountHealthRoutes = require('./routes/accountHealth')
@@ -135,6 +136,17 @@ class Application {
       // 📝 请求日志（使用自定义logger而不是morgan）
       this.app.use(requestLogger)
 
+      // 🐛 HTTP调试拦截器（仅在启用调试时生效）
+      if (process.env.DEBUG_HTTP_TRAFFIC === 'true') {
+        try {
+          const { debugInterceptor } = require('./middleware/debugInterceptor')
+          this.app.use(debugInterceptor)
+          logger.info('🐛 HTTP调试拦截器已启用 - 日志输出到 logs/http-debug-*.log')
+        } catch (error) {
+          logger.warn('⚠️ 无法加载HTTP调试拦截器:', error.message)
+        }
+      }
+
       // 🔧 基础中间件
       this.app.use(
         express.json({
@@ -238,6 +250,7 @@ class Application {
       this.app.use('/claude', apiRoutes) // /claude 路由别名，与 /api 功能相同
       this.app.use('/admin', adminRoutes)
       this.app.use('/admin', accountHealthRoutes)
+      this.app.use('/users', userRoutes)
       // 使用 web 路由（包含 auth 和页面重定向）
       this.app.use('/web', webRoutes)
       this.app.use('/apiStats', apiStatsRoutes)
@@ -528,7 +541,8 @@ class Application {
 
         const [expiredKeys, errorAccounts] = await Promise.all([
           apiKeyService.cleanupExpiredKeys(),
-          claudeAccountService.cleanupErrorAccounts()
+          claudeAccountService.cleanupErrorAccounts(),
+          claudeAccountService.cleanupTempErrorAccounts() // 新增：清理临时错误账户
         ])
 
         await redis.cleanup()
