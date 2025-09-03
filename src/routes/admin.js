@@ -2192,7 +2192,7 @@ router.post('/claude-console-accounts', authenticateAdmin, async (req, res) => {
 
     // 如果是分组类型，将账户添加到分组
     if (accountType === 'group' && groupId) {
-      await accountGroupService.addAccountToGroup(newAccount.id, groupId, newAccount.platform)
+      await accountGroupService.addAccountToGroup(newAccount.id, groupId, 'claude-console')
     }
 
     logger.success(`🎮 Admin created Claude Console account: ${name}`)
