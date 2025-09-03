@@ -430,14 +430,24 @@ EOF
         return 1
     fi
     
+    # 构建前端
+    print_info "构建管理后台界面..."
+    if [ -d "web/admin-spa" ]; then
+        cd web/admin-spa
+        npm install
+        npm run build
+        cd ../..
+        print_success "前端构建完成"
+    fi
+    
     # 保存实例配置
     add_instance_config "$INSTANCE_NAME" "$INSTANCE_DIR" "$APP_PORT" "$REDIS_HOST" "$REDIS_PORT"
     
     print_success "实例 '$INSTANCE_NAME' 安装完成！"
     echo
     print_info "实例信息："
-    echo "  访问地址: http://localhost:$APP_PORT"
-    echo "  管理界面: http://localhost:$APP_PORT/admin"
+    echo "  管理界面: http://localhost:$APP_PORT/admin-next/"
+    echo "  API地址: http://localhost:$APP_PORT/api"
     echo
     echo -n "按回车键继续..."
     read

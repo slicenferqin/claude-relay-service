@@ -160,6 +160,18 @@ start_instance() {
     
     cd "$dir" || { echo -e "${RED}无法进入目录${NC}"; return 1; }
     
+    # 检查前端是否已构建
+    if [ ! -d "web/admin-spa/dist" ]; then
+        echo -e "${YELLOW}检测到前端未构建，正在构建...${NC}"
+        if [ -d "web/admin-spa" ]; then
+            cd web/admin-spa
+            npm install
+            npm run build
+            cd ../..
+            echo -e "${GREEN}前端构建完成${NC}"
+        fi
+    fi
+    
     # 简单的启动命令
     echo "正在启动..."
     nohup npm start > /tmp/crs-$name.log 2>&1 &
@@ -170,6 +182,8 @@ start_instance() {
     
     if kill -0 $pid 2>/dev/null; then
         echo -e "${GREEN}实例 $name 已启动 (PID: $pid)${NC}"
+        echo "访问地址: http://localhost:$port/admin-next/"
+        echo "API地址: http://localhost:$port/api"
         echo "日志文件: /tmp/crs-$name.log"
     else
         echo -e "${RED}启动失败${NC}"
@@ -304,8 +318,23 @@ EOF
     echo "初始化..."
     npm run setup
     
+    # 构建前端
+    echo "构建管理后台界面..."
+    if [ -d "web/admin-spa" ]; then
+        cd web/admin-spa
+        echo "  安装前端依赖..."
+        npm install
+        echo "  构建前端文件..."
+        npm run build
+        cd ../..
+        echo -e "${GREEN}前端构建完成${NC}"
+    else
+        echo -e "${YELLOW}警告: 前端目录不存在${NC}"
+    fi
+    
     echo -e "${GREEN}安装完成！${NC}"
     echo "启动命令: cd $dir && npm start"
+    echo "访问地址: http://localhost:$port/admin-next/"
     echo "=============================="
 }
 
