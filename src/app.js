@@ -471,7 +471,7 @@ class Application {
       this.startCleanupTasks()
 
       // 🏥 启动账户健康监控和恢复管理器
-      await this.startAccountHealthServices()
+      // await this.startAccountHealthServices()
 
       // 🛑 优雅关闭
       this.setupGracefulShutdown()

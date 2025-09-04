@@ -14,6 +14,7 @@ const sessionHelper = require('../utils/sessionHelper')
 const router = express.Router()
 
 // 🔧 共享的消息处理函数
+// 完整的 handleMessagesRequest 函数
 async function handleMessagesRequest(req, res) {
   try {
     const startTime = Date.now()
@@ -48,35 +49,46 @@ async function handleMessagesRequest(req, res) {
     )
 
     if (isStream) {
-      // 流式响应 - 只使用官方真实usage数据
+      // 流式响应处理
       res.setHeader('Content-Type', 'text/event-stream')
       res.setHeader('Cache-Control', 'no-cache')
       res.setHeader('Connection', 'keep-alive')
       res.setHeader('Access-Control-Allow-Origin', '*')
-      res.setHeader('X-Accel-Buffering', 'no') // 禁用 Nginx 缓冲
+      res.setHeader('X-Accel-Buffering', 'no')
 
-      // 禁用 Nagle 算法，确保数据立即发送
       if (res.socket && typeof res.socket.setNoDelay === 'function') {
         res.socket.setNoDelay(true)
       }
 
-      // 流式响应不需要额外处理，中间件已经设置了监听器
-
       let usageDataCaptured = false
 
-      // 使用新的重试功能处理流式请求
+      // 选择账户
+      const sessionHash = sessionHelper.generateSessionHash(req.body)
+      const accountSelection = await unifiedClaudeScheduler.selectAccountForApiKey(
+        req.apiKey,
+        sessionHash,
+        req.body.model
+      )
+
+      if (!accountSelection || !accountSelection.accountId) {
+        return res.status(503).json({
+          error: {
+            type: 'service_unavailable',
+            message: 'No Claude accounts are currently available'
+          }
+        })
+      }
+
+      const { accountType } = accountSelection
+      logger.info(`🎯 Selected account type: ${accountType} for streaming request`)
+
+      // 使用现有的流式处理方法
       await claudeRelayService.relayStreamRequestWithRetry(
         req.body,
         req.apiKey,
         res,
         req.headers,
         (usageData) => {
-          // 回调函数：当检测到完整usage数据时记录真实token使用量
-          logger.info(
-            '🎯 Usage callback triggered with complete data:',
-            JSON.stringify(usageData, null, 2)
-          )
-
           if (
             usageData &&
             usageData.input_tokens !== undefined &&
@@ -84,7 +96,6 @@ async function handleMessagesRequest(req, res) {
           ) {
             const inputTokens = usageData.input_tokens || 0
             const outputTokens = usageData.output_tokens || 0
-            // 兼容处理：如果有详细的 cache_creation 对象，使用它；否则使用总的 cache_creation_input_tokens
             let cacheCreateTokens = usageData.cache_creation_input_tokens || 0
             let ephemeral5mTokens = 0
             let ephemeral1hTokens = 0
@@ -92,115 +103,106 @@ async function handleMessagesRequest(req, res) {
             if (usageData.cache_creation && typeof usageData.cache_creation === 'object') {
               ephemeral5mTokens = usageData.cache_creation.ephemeral_5m_input_tokens || 0
               ephemeral1hTokens = usageData.cache_creation.ephemeral_1h_input_tokens || 0
-              // 总的缓存创建 tokens 是两者之和
               cacheCreateTokens = ephemeral5mTokens + ephemeral1hTokens
             }
 
             const cacheReadTokens = usageData.cache_read_input_tokens || 0
             const model = usageData.model || 'unknown'
-
-            // 记录真实的token使用量（包含模型信息和所有4种token以及账户ID）
             const { accountId: usageAccountId } = usageData
 
-            // 构建 usage 对象以传递给 recordUsage
-            const usageObject = {
-              input_tokens: inputTokens,
-              output_tokens: outputTokens,
-              cache_creation_input_tokens: cacheCreateTokens,
-              cache_read_input_tokens: cacheReadTokens
-            }
+            apiKeyService.recordUsage(
+              req.apiKey.id,
+              inputTokens,
+              outputTokens,
+              cacheCreateTokens,
+              cacheReadTokens,
+              model,
+              usageAccountId
+            )
 
-            // 如果有详细的缓存创建数据，添加到 usage 对象中
-            if (ephemeral5mTokens > 0 || ephemeral1hTokens > 0) {
-              usageObject.cache_creation = {
-                ephemeral_5m_input_tokens: ephemeral5mTokens,
-                ephemeral_1h_input_tokens: ephemeral1hTokens
-              }
-            }
-
-            apiKeyService
-              .recordUsageWithDetails(req.apiKey.id, usageObject, model, usageAccountId)
-              .catch((error) => {
-                logger.error('❌ Failed to record stream usage:', error)
-              })
-
-            // 更新时间窗口内的token计数和费用
             if (req.rateLimitInfo) {
               const totalTokens = inputTokens + outputTokens + cacheCreateTokens + cacheReadTokens
+              redis.getClient().incrby(req.rateLimitInfo.tokenCountKey, totalTokens)
 
-              // 更新Token计数（向后兼容）
-              redis
-                .getClient()
-                .incrby(req.rateLimitInfo.tokenCountKey, totalTokens)
-                .catch((error) => {
-                  logger.error('❌ Failed to update rate limit token count:', error)
-                })
-              logger.api(`📊 Updated rate limit token count: +${totalTokens} tokens`)
-
-              // 计算并更新费用计数（新功能）
               if (req.rateLimitInfo.costCountKey) {
-                const costInfo = pricingService.calculateCost(usageData, model)
+                const usageObject = {
+                  input_tokens: inputTokens,
+                  output_tokens: outputTokens,
+                  cache_creation_input_tokens: cacheCreateTokens,
+                  cache_read_input_tokens: cacheReadTokens
+                }
+                const costInfo = pricingService.calculateCost(usageObject, model)
                 if (costInfo.totalCost > 0) {
-                  redis
-                    .getClient()
-                    .incrbyfloat(req.rateLimitInfo.costCountKey, costInfo.totalCost)
-                    .catch((error) => {
-                      logger.error('❌ Failed to update rate limit cost count:', error)
-                    })
-                  logger.api(`💰 Updated rate limit cost count: +$${costInfo.totalCost.toFixed(6)}`)
+                  redis.getClient().incrbyfloat(req.rateLimitInfo.costCountKey, costInfo.totalCost)
                 }
               }
             }
 
             usageDataCaptured = true
             logger.api(
-              `📊 Stream usage recorded (real) - Model: ${model}, Input: ${inputTokens}, Output: ${outputTokens}, Cache Create: ${cacheCreateTokens}, Cache Read: ${cacheReadTokens}, Total: ${inputTokens + outputTokens + cacheCreateTokens + cacheReadTokens} tokens`
-            )
-          } else {
-            logger.warn(
-              '⚠️ Usage callback triggered but data is incomplete:',
-              JSON.stringify(usageData)
+              `📊 Stream usage recorded - Model: ${model}, Tokens: ${inputTokens + outputTokens + cacheCreateTokens + cacheReadTokens}`
             )
           }
         }
       )
 
-      // 流式请求完成后 - 如果没有捕获到usage数据，记录警告
       setTimeout(() => {
         if (!usageDataCaptured) {
-          logger.warn('⚠️ No usage data captured from retry stream - no statistics recorded')
+          logger.warn('⚠️ No usage data captured from stream')
         }
-      }, 1000) // 1秒后检查
+      }, 1000)
     } else {
-      // 非流式响应 - 只使用官方真实usage数据
+      // 非流式响应处理
       logger.info('📄 Starting non-streaming request', {
         apiKeyId: req.apiKey.id,
         apiKeyName: req.apiKey.name
       })
 
-      // 使用新的重试功能处理非流式请求（支持Claude Official和Console）
-      logger.debug(`[DEBUG] Request query params: ${JSON.stringify(req.query)}`)
-      logger.debug(`[DEBUG] Request URL: ${req.url}`)
-      logger.debug(`[DEBUG] Request path: ${req.path}`)
-
-      // 使用新的重试功能处理非流式请求（支持Claude Official和Console）
-      const response = await claudeRelayService.relayNonStreamRequestWithRetry(
-        req.body,
+      // 选择账户
+      const sessionHash = sessionHelper.generateSessionHash(req.body)
+      const accountSelection = await unifiedClaudeScheduler.selectAccountForApiKey(
         req.apiKey,
-        req,
-        res,
-        req.headers
+        sessionHash,
+        req.body.model
       )
 
-      logger.info('📡 Claude API response received', {
-        statusCode: response.statusCode,
-        headers: JSON.stringify(response.headers),
-        bodyLength: response.body ? response.body.length : 0
-      })
+      if (!accountSelection || !accountSelection.accountId) {
+        return res.status(503).json({
+          error: {
+            type: 'service_unavailable',
+            message: 'No Claude accounts are currently available'
+          }
+        })
+      }
+
+      const { accountType } = accountSelection
+      logger.info(`🎯 Selected account type: ${accountType} for non-streaming request`)
+
+      let response
+      // 使用故障转移方法处理非流式请求
+      if (accountType === 'claude-official') {
+        response = await claudeRelayService.relayRequestWithFailover(
+          req.body,
+          req.apiKey,
+          req,
+          res,
+          req.headers
+        )
+      } else if (accountType === 'claude-console') {
+        response = await claudeConsoleRelayService.relayRequestWithFailover(
+          req.body,
+          req.apiKey,
+          req,
+          res,
+          req.headers
+        )
+      } else {
+        throw new Error(`Unsupported account type: ${accountType}`)
+      }
 
       res.status(response.statusCode)
 
-      // 设置响应头，避免 Content-Length 和 Transfer-Encoding 冲突
+      // 设置响应头
       const skipHeaders = ['content-encoding', 'transfer-encoding', 'content-length']
       Object.keys(response.headers).forEach((key) => {
         if (!skipHeaders.includes(key.toLowerCase())) {
@@ -210,13 +212,10 @@ async function handleMessagesRequest(req, res) {
 
       let usageRecorded = false
 
-      // 尝试解析JSON响应并提取usage信息
+      // 解析并处理响应
       try {
         const jsonData = JSON.parse(response.body)
 
-        logger.info('📊 Parsed Claude API response:', JSON.stringify(jsonData, null, 2))
-
-        // 从Claude API响应中提取usage信息（完整的token分类体系）
         if (
           jsonData.usage &&
           jsonData.usage.input_tokens !== undefined &&
@@ -228,7 +227,6 @@ async function handleMessagesRequest(req, res) {
           const cacheReadTokens = jsonData.usage.cache_read_input_tokens || 0
           const model = jsonData.model || req.body.model || 'unknown'
 
-          // 记录真实的token使用量（包含模型信息和所有4种token以及账户ID）
           const { accountId: responseAccountId } = response
           await apiKeyService.recordUsage(
             req.apiKey.id,
@@ -240,46 +238,33 @@ async function handleMessagesRequest(req, res) {
             responseAccountId
           )
 
-          // 更新时间窗口内的token计数和费用
           if (req.rateLimitInfo) {
             const totalTokens = inputTokens + outputTokens + cacheCreateTokens + cacheReadTokens
-
-            // 更新Token计数（向后兼容）
             await redis.getClient().incrby(req.rateLimitInfo.tokenCountKey, totalTokens)
-            logger.api(`📊 Updated rate limit token count: +${totalTokens} tokens`)
 
-            // 计算并更新费用计数（新功能）
             if (req.rateLimitInfo.costCountKey) {
               const costInfo = pricingService.calculateCost(jsonData.usage, model)
               if (costInfo.totalCost > 0) {
                 await redis
                   .getClient()
                   .incrbyfloat(req.rateLimitInfo.costCountKey, costInfo.totalCost)
-                logger.api(`💰 Updated rate limit cost count: +$${costInfo.totalCost.toFixed(6)}`)
               }
             }
           }
 
           usageRecorded = true
-          logger.api(
-            `📊 Non-stream usage recorded (real) - Model: ${model}, Input: ${inputTokens}, Output: ${outputTokens}, Cache Create: ${cacheCreateTokens}, Cache Read: ${cacheReadTokens}, Total: ${inputTokens + outputTokens + cacheCreateTokens + cacheReadTokens} tokens`
-          )
-        } else {
-          logger.warn('⚠️ No usage data found in Claude API JSON response')
+          const totalTokens = inputTokens + outputTokens + cacheCreateTokens + cacheReadTokens
+          logger.api(`📊 Non-stream usage recorded - Model: ${model}, Tokens: ${totalTokens}`)
         }
 
         res.json(jsonData)
       } catch (parseError) {
-        logger.warn('⚠️ Failed to parse Claude API response as JSON:', parseError.message)
-        logger.info('📄 Raw response body:', response.body)
+        logger.warn('⚠️ Failed to parse response as JSON:', parseError.message)
         res.send(response.body)
       }
 
-      // 如果没有记录usage，只记录警告，不进行估算
       if (!usageRecorded) {
-        logger.warn(
-          '⚠️ No usage data recorded for non-stream request - no statistics recorded (official data only)'
-        )
+        logger.warn('⚠️ No usage data recorded for non-stream request')
       }
     }
 
@@ -292,9 +277,7 @@ async function handleMessagesRequest(req, res) {
       stack: error.stack
     })
 
-    // 确保在任何情况下都能返回有效的JSON响应
     if (!res.headersSent) {
-      // 根据错误类型设置适当的状态码
       let statusCode = 500
       let errorType = 'Relay service error'
 
@@ -318,7 +301,6 @@ async function handleMessagesRequest(req, res) {
         timestamp: new Date().toISOString()
       })
     } else {
-      // 如果响应头已经发送，尝试结束响应
       if (!res.destroyed && !res.finished) {
         res.end()
       }

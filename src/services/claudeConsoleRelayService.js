@@ -1,5 +1,8 @@
 const axios = require('axios')
 const claudeConsoleAccountService = require('./claudeConsoleAccountService')
+const unifiedClaudeScheduler = require('./unifiedClaudeScheduler')
+const sessionHelper = require('../utils/sessionHelper')
+const accountHealthManager = require('../utils/accountHealthManager')
 const logger = require('../utils/logger')
 const config = require('../../config/config')
 
@@ -8,7 +11,262 @@ class ClaudeConsoleRelayService {
     this.defaultUserAgent = 'claude-cli/1.0.69 (external, cli)'
   }
 
-  // 🚀 转发请求到Claude Console API
+  // 🛠️ 故障判定工具方法
+  _shouldFailover(error, response) {
+    // 1. 网络错误
+    if (error) {
+      if (error.code === 'ECONNREFUSED') {
+        return true
+      }
+      if (error.code === 'ETIMEDOUT') {
+        return true
+      }
+      if (error.code === 'ENOTFOUND') {
+        return true
+      }
+      if (error.code === 'ECONNRESET') {
+        return true
+      }
+      if (error.message?.includes('socket hang up')) {
+        return true
+      }
+      if (error.message?.includes('EPIPE')) {
+        return true
+      }
+    }
+
+    // 2. HTTP错误响应
+    if (response) {
+      // 4xx 客户端错误（部分需要重试）
+      if (response.statusCode === 429) {
+        return true
+      } // 速率限制
+      if (response.statusCode === 401) {
+        return true
+      } // 认证失败
+      if (response.statusCode === 403) {
+        return true
+      } // 权限问题
+      if (response.statusCode >= 500) {
+        return true
+      } // 所有服务器错误
+    }
+
+    return false
+  }
+
+  // 🛠️ 不应该重试的错误判定
+  _isNonRetryableError(error, response) {
+    if (response?.statusCode === 400) {
+      return true
+    } // 请求格式错误
+    if (response?.statusCode === 422) {
+      return true
+    } // 请求内容问题
+    return false
+  }
+
+  // 🛠️ 构建Console账户池
+  async _buildConsoleAccountPool(apiKeyData, sessionHash, model) {
+    const accountPool = []
+
+    try {
+      // 使用统一调度器选择Console账户
+      const accountSelection = await unifiedClaudeScheduler.selectAccountForApiKey(
+        apiKeyData,
+        sessionHash,
+        model
+      )
+
+      if (
+        accountSelection &&
+        accountSelection.accountId &&
+        accountSelection.accountType === 'claude-console'
+      ) {
+        // 获取主账户
+        const primaryAccount = await claudeConsoleAccountService.getAccount(
+          accountSelection.accountId
+        )
+        if (primaryAccount) {
+          accountPool.push({
+            id: accountSelection.accountId,
+            type: accountSelection.accountType,
+            name: primaryAccount.name,
+            priority: primaryAccount.priority || 0,
+            ...primaryAccount
+          })
+        }
+
+        // 获取其他Console账户作为备选
+        const allAccounts = await claudeConsoleAccountService.getAllAccounts()
+        for (const account of allAccounts) {
+          // 跳过已添加的主账户
+          if (account.id === accountSelection.accountId) {
+            continue
+          }
+
+          // 只添加支持当前模型的账户
+          if (this._isModelSupported(account, model)) {
+            accountPool.push({
+              id: account.id,
+              type: 'claude-console',
+              name: account.name,
+              priority: account.priority || 0,
+              ...account
+            })
+          }
+        }
+
+        // 按优先级排序（高优先级在前）
+        accountPool.sort((a, b) => (b.priority || 0) - (a.priority || 0))
+      }
+    } catch (error) {
+      logger.warn('⚠️ Failed to build console account pool:', error.message)
+    }
+
+    return accountPool
+  }
+
+  // 🛠️ 检查账户是否支持指定模型
+  _isModelSupported(account, model) {
+    // 如果没有指定支持的模型列表，假设支持所有模型
+    if (!account.supportedModels) {
+      return true
+    }
+
+    // 如果supportedModels是对象（模型映射），检查是否有对应的映射
+    if (typeof account.supportedModels === 'object' && !Array.isArray(account.supportedModels)) {
+      return (
+        claudeConsoleAccountService.getMappedModel(account.supportedModels, model) !== model ||
+        Object.keys(account.supportedModels).includes(model)
+      )
+    }
+
+    // 如果是数组，检查模型是否在支持列表中
+    if (Array.isArray(account.supportedModels)) {
+      return account.supportedModels.includes(model)
+    }
+
+    return true
+  }
+
+  // 🔄 带故障转移的Console请求方法（新增）
+  async relayRequestWithFailover(
+    requestBody,
+    apiKeyData,
+    clientRequest,
+    clientResponse,
+    clientHeaders,
+    options = {}
+  ) {
+    const sessionHash = sessionHelper.generateSessionHash(requestBody)
+    const accountPool = await this._buildConsoleAccountPool(
+      apiKeyData,
+      sessionHash,
+      requestBody.model
+    )
+    const attemptedAccounts = []
+    let lastError = null
+    const startTime = Date.now()
+
+    logger.info('🔄 [FAILOVER_START]', {
+      apiKey: apiKeyData.name,
+      model: requestBody.model,
+      availableAccounts: accountPool.length,
+      isStream: options.stream || false,
+      accountType: 'claude-console'
+    })
+
+    for (const account of accountPool) {
+      // 跳过不健康的账户
+      if (!accountHealthManager.isHealthy(account.id)) {
+        logger.debug(`⏭️ Skipping unhealthy console account: ${account.id}`, {
+          failureInfo: accountHealthManager.getFailureInfo(account.id)
+        })
+        continue
+      }
+
+      try {
+        attemptedAccounts.push(account.id)
+
+        logger.info('🎯 [ACCOUNT_ATTEMPT]', {
+          accountId: account.id,
+          accountName: account.name,
+          attemptNumber: attemptedAccounts.length,
+          totalAccounts: accountPool.length,
+          accountType: 'claude-console'
+        })
+
+        // 调用现有的relayRequest方法
+        const response = await this.relayRequest(
+          requestBody,
+          apiKeyData,
+          clientRequest,
+          clientResponse,
+          clientHeaders,
+          account.id,
+          options
+        )
+
+        // 检查响应是否成功
+        if (response.statusCode >= 200 && response.statusCode < 300) {
+          // 成功，标记账户为健康
+          accountHealthManager.markSuccess(account.id)
+
+          logger.info('✅ [FAILOVER_SUCCESS]', {
+            finalAccountId: account.id,
+            totalAttempts: attemptedAccounts.length,
+            duration: Date.now() - startTime,
+            accountType: 'claude-console'
+          })
+
+          return response
+        }
+
+        // 响应不成功，检查是否应该重试
+        logger.warn('⚠️ [ACCOUNT_FAILED]', {
+          accountId: account.id,
+          error: `HTTP ${response.statusCode}`,
+          statusCode: response.statusCode,
+          willRetry: true,
+          accountType: 'claude-console'
+        })
+
+        lastError = new Error(`HTTP ${response.statusCode}`)
+
+        // 如果是不可重试的错误，直接返回
+        if (this._isNonRetryableError(null, response)) {
+          logger.info('🛑 Non-retryable error, returning response')
+          return response
+        }
+
+        // 标记账户失败
+        accountHealthManager.markFailed(account.id, lastError, response.statusCode)
+      } catch (error) {
+        logger.error('❌ [ACCOUNT_FAILED]', {
+          accountId: account.id,
+          error: error.message,
+          willRetry: true,
+          accountType: 'claude-console'
+        })
+
+        lastError = error
+        accountHealthManager.markFailed(account.id, error)
+      }
+    }
+
+    // 所有账户都失败了
+    logger.error('❌ [FAILOVER_EXHAUSTED]', {
+      attemptedAccounts,
+      lastError: lastError?.message,
+      duration: Date.now() - startTime,
+      accountType: 'claude-console'
+    })
+
+    throw lastError || new Error('All console accounts failed')
+  }
+
+  // 🚀 转发请求到Claude Console API（原方法）
   async relayRequest(
     requestBody,
     apiKeyData,

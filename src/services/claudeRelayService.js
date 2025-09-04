@@ -10,6 +10,7 @@ const sessionHelper = require('../utils/sessionHelper')
 const logger = require('../utils/logger')
 const config = require('../../config/config')
 const claudeCodeHeadersService = require('./claudeCodeHeadersService')
+const accountHealthManager = require('../utils/accountHealthManager')
 
 class ClaudeRelayService {
   constructor() {
@@ -59,7 +60,128 @@ class ClaudeRelayService {
     return false
   }
 
-  // 🔄 带故障转移的转发请求
+  // 🛠️ 故障判定工具方法
+  _shouldFailover(error, response) {
+    // 1. 网络错误
+    if (error) {
+      if (error.code === 'ECONNREFUSED') {
+        return true
+      }
+      if (error.code === 'ETIMEDOUT') {
+        return true
+      }
+      if (error.code === 'ENOTFOUND') {
+        return true
+      }
+      if (error.code === 'ECONNRESET') {
+        return true
+      }
+      if (error.message?.includes('socket hang up')) {
+        return true
+      }
+      if (error.message?.includes('EPIPE')) {
+        return true
+      }
+    }
+
+    // 2. HTTP错误响应
+    if (response) {
+      // 4xx 客户端错误（部分需要重试）
+      if (response.statusCode === 429) {
+        return true
+      } // 速率限制
+      if (response.statusCode === 401) {
+        return true
+      } // 认证失败
+      if (response.statusCode === 403) {
+        return true
+      } // 权限问题
+      if (response.statusCode >= 500) {
+        return true
+      } // 所有服务器错误
+    }
+
+    return false
+  }
+
+  // 🛠️ 不应该重试的错误判定
+  _isNonRetryableError(error, response) {
+    if (response?.statusCode === 400) {
+      return true
+    } // 请求格式错误
+    if (response?.statusCode === 422) {
+      return true
+    } // 请求内容问题
+    return false
+  }
+
+  // 🛠️ 构建可用账户池
+  async _buildAccountPool(apiKeyData, sessionHash, model) {
+    const accountPool = []
+
+    try {
+      // 使用统一调度器选择账户
+      const accountSelection = await unifiedClaudeScheduler.selectAccountForApiKey(
+        apiKeyData,
+        sessionHash,
+        model
+      )
+
+      if (accountSelection && accountSelection.accountId) {
+        // 获取主账户
+        const primaryAccount = await claudeAccountService.getAccount(accountSelection.accountId)
+        if (primaryAccount) {
+          accountPool.push({
+            id: accountSelection.accountId,
+            type: accountSelection.accountType,
+            name: primaryAccount.name,
+            priority: primaryAccount.priority || 0,
+            ...primaryAccount
+          })
+        }
+
+        // 获取相同类型的其他账户作为备选
+        const allAccounts = await claudeAccountService.getAllAccounts()
+        for (const account of allAccounts) {
+          // 跳过已添加的主账户
+          if (account.id === accountSelection.accountId) {
+            continue
+          }
+
+          // 只添加相同类型且支持当前模型的账户
+          if (this._isModelSupported(account, model)) {
+            accountPool.push({
+              id: account.id,
+              type: 'claude-official', // 假设都是官方账户
+              name: account.name,
+              priority: account.priority || 0,
+              ...account
+            })
+          }
+        }
+
+        // 按优先级排序（高优先级在前）
+        accountPool.sort((a, b) => (b.priority || 0) - (a.priority || 0))
+      }
+    } catch (error) {
+      logger.warn('⚠️ Failed to build account pool:', error.message)
+    }
+
+    return accountPool
+  }
+
+  // 🛠️ 检查账户是否支持指定模型
+  _isModelSupported(account, model) {
+    // 如果没有指定支持的模型列表，假设支持所有模型
+    if (!account.supportedModels || !Array.isArray(account.supportedModels)) {
+      return true
+    }
+
+    // 检查模型是否在支持列表中
+    return account.supportedModels.includes(model)
+  }
+
+  // 🔄 带故障转移的转发请求（重写版本）
   async relayRequestWithFailover(
     requestBody,
     apiKeyData,
@@ -69,104 +191,135 @@ class ClaudeRelayService {
     options = {}
   ) {
     const sessionHash = sessionHelper.generateSessionHash(requestBody)
-    const failoverConfig = require('../../config/config')
-    const maxRetries = failoverConfig.failover?.maxRetries || 3 // 最多重试3次（使用不同账户）
-    let lastError = null
+    const accountPool = await this._buildAccountPool(apiKeyData, sessionHash, requestBody.model)
     const attemptedAccounts = []
+    let lastError = null
+    const startTime = Date.now()
 
-    logger.info(`🔄 Starting request with failover for API key: ${apiKeyData.name}`)
+    logger.info('🔄 [FAILOVER_START]', {
+      apiKey: apiKeyData.name,
+      model: requestBody.model,
+      availableAccounts: accountPool.length,
+      isStream: options.stream || false
+    })
 
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    for (const account of accountPool) {
+      // 跳过不健康的账户
+      if (!accountHealthManager.isHealthy(account.id)) {
+        logger.debug(`⏭️ Skipping unhealthy account: ${account.id}`, {
+          failureInfo: accountHealthManager.getFailureInfo(account.id)
+        })
+        continue
+      }
+
       try {
-        logger.info(`🎯 Attempt ${attempt}/${maxRetries} for API key: ${apiKeyData.name}`)
+        attemptedAccounts.push(account.id)
 
-        // 选择可用的Claude账户（排除已尝试的账户）
-        const accountSelection = await unifiedClaudeScheduler.selectAccountForApiKey(
-          apiKeyData,
-          sessionHash,
-          requestBody.model,
-          { excludeAccounts: attemptedAccounts }
-        )
-
-        if (!accountSelection || !accountSelection.accountId) {
-          logger.warn(`⚠️ No available accounts for attempt ${attempt}`)
-          continue
-        }
-
-        const { accountId, accountType } = accountSelection
-        attemptedAccounts.push(accountId)
-
-        logger.info(`📤 Attempt ${attempt}: Using account ${accountId} (${accountType})`)
+        logger.info('🎯 [ACCOUNT_ATTEMPT]', {
+          accountId: account.id,
+          accountName: account.name,
+          attemptNumber: attemptedAccounts.length,
+          totalAccounts: accountPool.length
+        })
 
         // 尝试使用当前账户发送请求
-        const result = await this.relayRequest(
+        const response = await this._relayToOfficialAPI(
           requestBody,
-          apiKeyData,
-          clientRequest,
-          clientResponse,
+          account,
           clientHeaders,
-          { ...options, accountId, accountType, attempt }
+          options
         )
 
-        // 检查响应是否正常
-        if (this._isSuccessfulResponse(result)) {
-          logger.info(`✅ Request succeeded on attempt ${attempt} with account ${accountId}`)
-          return result
-        } else {
-          logger.warn(
-            `❌ Request failed on attempt ${attempt} with account ${accountId}: ${result.statusCode}`
-          )
-          lastError = result
+        // 检查响应是否成功
+        if (response.statusCode >= 200 && response.statusCode < 300) {
+          // 成功，标记账户为健康
+          accountHealthManager.markSuccess(account.id)
 
-          // 如果是特定错误，标记账户为临时不可用
-          if (this._shouldMarkAccountUnavailable(result)) {
-            logger.warn(`🚫 Marking account ${accountId} as temporarily unavailable`)
-            await unifiedClaudeScheduler.markAccountTemporarilyUnavailable(accountId, accountType)
-          }
+          logger.info('✅ [FAILOVER_SUCCESS]', {
+            finalAccountId: account.id,
+            totalAttempts: attemptedAccounts.length,
+            duration: Date.now() - startTime
+          })
+
+          return response
         }
+
+        // 响应不成功，检查是否应该重试
+        logger.warn('⚠️ [ACCOUNT_FAILED]', {
+          accountId: account.id,
+          error: `HTTP ${response.statusCode}`,
+          statusCode: response.statusCode,
+          willRetry: true
+        })
+
+        lastError = new Error(`HTTP ${response.statusCode}`)
+
+        // 如果是不可重试的错误，直接返回
+        if (this._isNonRetryableError(null, response)) {
+          logger.info('🛑 Non-retryable error, returning response')
+          return response
+        }
+
+        // 标记账户失败
+        accountHealthManager.markFailed(account.id, lastError, response.statusCode)
       } catch (error) {
-        logger.error(`💥 Exception on attempt ${attempt}:`, error)
+        logger.error('❌ [ACCOUNT_FAILED]', {
+          accountId: account.id,
+          error: error.message,
+          willRetry: true
+        })
+
         lastError = error
+        accountHealthManager.markFailed(account.id, error)
       }
     }
 
-    // 所有账户都失败了，尝试使用兜底账户
-    logger.warn(`🆘 All accounts failed, trying fallback account`)
+    // 所有账户都失败了
+    logger.error('❌ [FAILOVER_EXHAUSTED]', {
+      attemptedAccounts,
+      lastError: lastError?.message,
+      duration: Date.now() - startTime
+    })
+
+    throw lastError || new Error('All accounts failed')
+  }
+
+  // 🛠️ 转发到官方API的具体实现
+  async _relayToOfficialAPI(requestBody, account, clientHeaders, options = {}) {
     try {
-      const fallbackResult = await this._tryFallbackAccount(
-        requestBody,
-        apiKeyData,
-        clientRequest,
-        clientResponse,
+      // 获取有效的访问token
+      const accessToken = await claudeAccountService.getValidAccessToken(account.id)
+
+      // 处理请求体
+      const processedBody = this._processRequestBody(requestBody, clientHeaders)
+
+      // 获取代理配置
+      const proxyAgent = await this._getProxyAgent(account.id)
+
+      // 发送请求到Claude API
+      const response = await this._makeClaudeRequest(
+        processedBody,
+        accessToken,
+        proxyAgent,
         clientHeaders,
+        account.id,
+        null, // requestCallback
         options
       )
 
-      if (fallbackResult) {
-        logger.info(`🆘✅ Fallback account succeeded`)
-        return fallbackResult
+      return response
+    } catch (error) {
+      // 将网络错误等转换为统一的响应格式
+      return {
+        statusCode: 500,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          error: {
+            type: 'internal_server_error',
+            message: error.message || 'Request failed'
+          }
+        })
       }
-    } catch (fallbackError) {
-      logger.error(`🆘❌ Fallback account also failed:`, fallbackError)
-    }
-
-    // 所有尝试都失败了
-    logger.error(`💀 All retry attempts exhausted for API key: ${apiKeyData.name}`)
-
-    if (lastError && lastError.statusCode) {
-      return lastError
-    }
-
-    // 返回通用错误响应
-    return {
-      statusCode: 503,
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        error: {
-          type: 'service_unavailable',
-          message: 'All Claude accounts are currently unavailable. Please try again later.'
-        }
-      })
     }
   }
 
